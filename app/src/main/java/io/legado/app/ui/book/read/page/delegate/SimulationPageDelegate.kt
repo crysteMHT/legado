@@ -36,10 +36,14 @@ import kotlin.math.sign
 import kotlin.math.sin
 
 /**
- * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v4 零闪烁收尾版）。
- * 修复内容：
- * 1. 修复翻页动画结束前卷页柱面与投影尚未完全滑出左边界（导致 hideGL 时左侧约 15%~20% 区域突然闪消失）的问题；
- * 2. 优化背面纸张亮度与底页阴影衰减，在浅色/护眼绿背景下过渡更干净通透。
+ * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v5 彻底消除结束回闪版）。
+ *
+ * 根因修复说明：
+ * 1. 修复 PageDelegate.computeScroll() 结束时 onAnimStop() 先隐藏 GL 层，但 stopScroll() 延迟到下一帧才把
+ *    isRunning 设为 false，导致期间 dispatchDraw() -> onDraw() 误判仍在翻页并再次 showGL() 闪现 1 帧旧缓冲的问题；
+ * 2. 引入首帧就绪同步（hasFreshFrame + alpha 门控）与延迟首帧绘制，避免新一次翻页开始时闪现上一次翻页的残影；
+ * 3. 提前完成左边界收尾退出（uExit 在 -0.82*aspect 处即完全移出），给异步 GL 渲染线程留出 2~3 帧纯净底页缓冲，
+ *    确保动画结束切回 ReadView 时零接缝、零闪烁。
  */
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
@@ -56,16 +60,19 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
+        alpha = 0f
         visibility = View.INVISIBLE
     }
 
     private var glActive = false
+    private var animFinished = false
 
     init {
         readView.addView(glView)
     }
 
     override fun setBitmap() {
+        animFinished = false
         when (mDirection) {
             PageDirection.PREV -> {
                 prevBitmap = prevPage.screenshot(prevBitmap, screenshotCanvas)
@@ -91,10 +98,12 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         super.onTouch(event)
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
+                animFinished = false
                 calcCornerXY(event.x, event.y)
             }
 
             MotionEvent.ACTION_MOVE -> {
+                animFinished = false
                 if ((startY > viewHeight / 3 && startY < viewHeight * 2 / 3)
                     || mDirection == PageDirection.PREV
                 ) {
@@ -125,6 +134,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     }
 
     override fun onAnimStart(animationSpeed: Int) {
+        animFinished = false
         var dx: Float
         val dy: Float
         if (isCancel) {
@@ -157,14 +167,15 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     }
 
     override fun onAnimStop() {
+        animFinished = true
+        hideGL()
         if (!isCancel) {
             readView.fillPage(mDirection)
         }
-        hideGL()
     }
 
     override fun onDraw(canvas: Canvas) {
-        if (!isRunning) {
+        if (!isRunning || animFinished) {
             hideGL()
             return
         }
@@ -172,7 +183,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             hideGL()
             return
         }
-        showGL()
         glView.updateCurl(
             touchX = touchX,
             touchY = touchY,
@@ -180,10 +190,12 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             viewW = viewWidth.toFloat(),
             viewH = viewHeight.toFloat()
         )
+        showGL()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        animFinished = true
         hideGL()
         glView.release()
         readView.removeView(glView)
@@ -200,12 +212,16 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             glActive = true
             glView.bringToFront()
             glView.visibility = View.VISIBLE
+            glView.alpha = if (glView.hasFreshFrame) 1f else 0f
+        } else if (glView.hasFreshFrame && glView.alpha < 1f) {
+            glView.alpha = 1f
         }
     }
 
     private fun hideGL() {
-        if (glActive || glView.visibility == View.VISIBLE) {
+        if (glActive || glView.visibility == View.VISIBLE || glView.alpha > 0f) {
             glActive = false
+            glView.alpha = 0f
             glView.visibility = View.INVISIBLE
         }
     }
@@ -247,6 +263,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         @Volatile private var pendingBottom: Bitmap? = null
         @Volatile private var dirtyTextures = false
         @Volatile private var renderQueued = false
+        @Volatile private var flipGeneration = 0
+        @Volatile var hasFreshFrame = false
+            private set
 
         private var bgR = 0.94f
         private var bgG = 0.91f
@@ -314,11 +333,13 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 pendingTop = top
                 pendingBottom = bottom
                 dirtyTextures = true
+                flipGeneration++
+                hasFreshFrame = false
                 bgR = Color.red(paperColor) / 255f
                 bgG = Color.green(paperColor) / 255f
                 bgB = Color.blue(paperColor) / 255f
             }
-            scheduleRender()
+            // 不在这里立即 scheduleRender，等 updateCurl 传入本次翻页的新坐标后再一起渲染首帧，避免闪出上次残影
         }
 
         fun updateCurl(
@@ -357,7 +378,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             surfaceH = max(height, 1)
             glHandler.post {
                 initEGL(surface)
-                drawFrameOnGL()
+                if (pendingTop != null && pendingBottom != null) {
+                    drawFrameOnGL()
+                }
             }
         }
 
@@ -367,7 +390,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             glHandler.post {
                 if (glReady) {
                     GLES20.glViewport(0, 0, surfaceW, surfaceH)
-                    drawFrameOnGL()
+                    if (pendingTop != null && pendingBottom != null) {
+                        drawFrameOnGL()
+                    }
                 }
             }
         }
@@ -465,6 +490,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             val topBmp: Bitmap?
             val bottomBmp: Bitmap?
             val needUpload: Boolean
+            val gen: Int
             val tx: Float
             val ty: Float
             val cy: Float
@@ -479,6 +505,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 bottomBmp = pendingBottom
                 needUpload = dirtyTextures
                 dirtyTextures = false
+                gen = flipGeneration
                 tx = curlTouchX
                 ty = curlTouchY
                 cy = curlCornerY
@@ -573,6 +600,15 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             }
 
             EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+
+            if (!hasFreshFrame && gen == flipGeneration) {
+                hasFreshFrame = true
+                post {
+                    if (visibility == View.VISIBLE && hasFreshFrame) {
+                        alpha = 1f
+                    }
+                }
+            }
         }
 
         private fun buildCylinderMesh(
@@ -619,27 +655,38 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             val r = 0.045f + 0.055f * sin(leftProgress * PI).toFloat()
             val halfCirc = (PI * r).toFloat()
 
-            // 5. 关键修复：确保在 leftProgress -> 1（翻页动画收尾）时，折痕轴 ax 完全滑出左边界 (-(r * 2.5f))
-            //    这样在 onAnimStop 隐藏 GL 层前，卷页和投影已 100% 移出屏幕，彻底消除左侧闪烁！
+            // 5. 提前在 tx = -0.82*aspect 处即完全移出左边界，留出 2~3 帧纯净底页缓冲，避免异步 GL 延迟导致残影
             val ax: Float
             if (tx >= 0f) {
-                ax = (tx + cx) * 0.5f - dx * (r * 0.2f)
+                val baseAx = (tx + cx) * 0.5f - dx * (r * 0.2f)
+                // 右边界收尾（PREV 翻页完成或取消翻页）：贴近右边时平滑展平
+                val rightGap = cx - tx
+                ax = if (rightGap < r * 1.2f) {
+                    val uRight = 1f - min(max(rightGap / (r * 1.2f), 0f), 1f)
+                    baseAx + ((cx + r * 0.3f) - baseAx) * uRight
+                } else {
+                    baseAx
+                }
             } else {
-                // tx 从 0 到 -aspect 时，u 从 0 到 1；ax 从 0.5*aspect 平滑滑到 -(r * 2.5f)
-                val uExit = min(max(-tx / aspect, 0f), 1f)
+                val uExit = min(max(-tx / (aspect * 0.82f), 0f), 1f)
                 val startAx = cx * 0.5f - dx * (r * 0.2f)
-                val endAx = -(r * 2.5f)
+                val endAx = -(r * 2.6f)
                 ax = startAx + (endAx - startAx) * uExit
             }
             val ay = (ty + cy) * 0.5f - dy * (r * 0.2f)
 
-            // 收尾阶段同步将阴影柔和淡出至 0
-            val exitFade = if (ax < r * 0.8f) {
-                min(max((ax + r * 1.5f) / (r * 2.3f), 0f), 1f)
+            // 收尾阶段同步将左右两端阴影柔和淡出至 0
+            val leftFade = if (ax < r * 0.9f) {
+                min(max((ax + r * 1.4f) / (r * 2.3f), 0f), 1f)
             } else {
                 1f
             }
-            shadowAlpha = 0.16f * exitFade
+            val rightFade = if (ax > cx - r * 0.8f) {
+                min(max((cx + r * 0.1f - ax) / (r * 0.9f), 0f), 1f)
+            } else {
+                1f
+            }
+            shadowAlpha = 0.16f * leftFade * rightFade
 
             axisAx = ax
             axisAy = ay
