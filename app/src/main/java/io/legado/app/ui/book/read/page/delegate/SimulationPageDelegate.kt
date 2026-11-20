@@ -27,17 +27,19 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sign
 import kotlin.math.sin
 
 /**
- * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v2 修复版）。
+ * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v3 书脊固定 + 零穿模版）。
  * 修复内容：
- * 1. 改用 TextureView + EGL14 替代 GLSurfaceView，彻底解决翻页结束后黑屏/遮挡菜单的问题；
- * 2. 加密 3D 网格至 64x48，并将光照、正反面过渡与内外折痕阴影改为片元着色器逐像素连续计算，消除锯齿与生硬灰带。
+ * 1. 关闭易引发 Z-fighting 闪烁的深度缓冲，改为“底页 -> 正面 -> 背面”三遍严格分层绘制，彻底消除左侧闪烁与穿模；
+ * 2. 增加物理书脊圆弧约束与折痕倾角限制，牢牢固定左侧装订边（x=0），彻底杜绝上下对折。
  */
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
@@ -111,17 +113,11 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         super.setDirection(direction)
         when (direction) {
             PageDirection.PREV -> {
-                if (startX > viewWidth / 2) {
-                    calcCornerXY(startX, viewHeight.toFloat())
-                } else {
-                    calcCornerXY(viewWidth - startX, viewHeight.toFloat())
-                }
+                calcCornerXY(viewWidth.toFloat(), viewHeight.toFloat())
             }
 
             PageDirection.NEXT -> {
-                if (viewWidth / 2 > startX) {
-                    calcCornerXY(viewWidth - startX, startY)
-                }
+                calcCornerXY(viewWidth.toFloat(), startY)
             }
 
             else -> Unit
@@ -180,7 +176,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         glView.updateCurl(
             touchX = touchX,
             touchY = touchY,
-            cornerX = mCornerX.toFloat(),
             cornerY = mCornerY.toFloat(),
             viewW = viewWidth.toFloat(),
             viewH = viewHeight.toFloat()
@@ -216,13 +211,14 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     }
 
     private fun calcCornerXY(x: Float, y: Float) {
-        mCornerX = if (x <= viewWidth / 2) 0 else viewWidth
+        // 始终以右侧边缘作为翻起角，左侧 x=0 作为装订书脊固定不动
+        mCornerX = viewWidth
         mCornerY = if (y <= viewHeight / 2) 0 else viewHeight
     }
 
     /**
      * 基于 TextureView + EGL14 的 3D 圆柱体卷页渲染视图。
-     * 作为普通 View 参与窗口合成，INVISIBLE 时彻底透明且保持 EGL 上下文存活，绝不黑屏、不闪黑。
+     * 采用“底页 -> 正面 -> 背面”三遍严格分层绘制（无深度缓冲穿模闪烁），并固定左侧书脊。
      */
     private class PageCurlTextureView(context: Context) : TextureView(context),
         TextureView.SurfaceTextureListener {
@@ -232,8 +228,8 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         private val vertexCount = (cols + 1) * (rows + 1)
         private val indexCount = cols * rows * 6
 
-        // 每个顶点: x, y, z, u, v, dist (6 floats)
-        private val meshFloats = FloatArray(vertexCount * 6)
+        // 每个顶点: x, y, u, v, dist (5 floats)
+        private val meshFloats = FloatArray(vertexCount * 5)
         private val meshBuffer: FloatBuffer = ByteBuffer.allocateDirect(meshFloats.size * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer()
         private val indexBuffer: ShortBuffer = ByteBuffer.allocateDirect(indexCount * 2)
@@ -263,7 +259,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
         private var curlTouchX = 0f
         private var curlTouchY = 0f
-        private var curlCornerX = 1f
         private var curlCornerY = 1f
         private var curlW = 1f
         private var curlH = 1f
@@ -333,7 +328,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         fun updateCurl(
             touchX: Float,
             touchY: Float,
-            cornerX: Float,
             cornerY: Float,
             viewW: Float,
             viewH: Float
@@ -341,7 +335,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             synchronized(lock) {
                 curlTouchX = touchX
                 curlTouchY = touchY
-                curlCornerX = cornerX
                 curlCornerY = cornerY
                 curlW = max(viewW, 1f)
                 curlH = max(viewH, 1f)
@@ -403,10 +396,11 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 EGL14.EGL_GREEN_SIZE, 8,
                 EGL14.EGL_BLUE_SIZE, 8,
                 EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_DEPTH_SIZE, 16,
+                EGL14.EGL_DEPTH_SIZE, 0,
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_NONE
             )
+
             val configs = arrayOfNulls<EGLConfig>(1)
             val numConfigs = IntArray(1)
             if (!EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, 1, numConfigs, 0) || numConfigs[0] <= 0) {
@@ -429,6 +423,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
             GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0f, 0f, 0f, 0f)
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
             GLES20.glEnable(GLES20.GL_BLEND)
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
@@ -476,7 +471,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             val needUpload: Boolean
             val tx: Float
             val ty: Float
-            val cx: Float
             val cy: Float
             val w: Float
             val h: Float
@@ -491,7 +485,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 dirtyTextures = false
                 tx = curlTouchX
                 ty = curlTouchY
-                cx = curlCornerX
                 cy = curlCornerY
                 w = curlW
                 h = curlH
@@ -511,17 +504,16 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 }
             }
 
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             if (topBmp == null || bottomBmp == null) {
                 EGL14.eglSwapBuffers(eglDisplay, eglSurface)
                 return
             }
 
             val aspect = w / h
-            buildCylinderMesh(tx, ty, cx, cy, aspect)
+            buildCylinderMesh(tx, ty, cy, aspect)
 
-            // 1. 底层下一页 + 柔和外投影
-            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            // Pass 1：底层下一页 + 柔和外投影
             GLES20.glUseProgram(bgProgram)
             val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPos")
             val bgUvLoc = GLES20.glGetAttribLocation(bgProgram, "aUv")
@@ -543,25 +535,23 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             GLES20.glDisableVertexAttribArray(bgPosLoc)
             GLES20.glDisableVertexAttribArray(bgUvLoc)
 
-            // 2. 上层 3D 圆柱卷曲书页（逐像素连续光照 + 背面透字）
-            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-            GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+            // Pass 2 & Pass 3：严格分层绘制上层书页（先画正面，再画背面），彻底杜绝深度穿模与闪烁
             GLES20.glUseProgram(frontProgram)
-
-            val stride = 6 * 4
+            val stride = 5 * 4
             val posLoc = GLES20.glGetAttribLocation(frontProgram, "aPos")
             val uvLoc = GLES20.glGetAttribLocation(frontProgram, "aUv")
             val distLoc = GLES20.glGetAttribLocation(frontProgram, "aDist")
+            val passLoc = GLES20.glGetUniformLocation(frontProgram, "uPass")
 
             meshBuffer.position(0)
             GLES20.glEnableVertexAttribArray(posLoc)
-            GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, stride, meshBuffer)
+            GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, stride, meshBuffer)
 
-            meshBuffer.position(3)
+            meshBuffer.position(2)
             GLES20.glEnableVertexAttribArray(uvLoc)
             GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, stride, meshBuffer)
 
-            meshBuffer.position(5)
+            meshBuffer.position(4)
             GLES20.glEnableVertexAttribArray(distLoc)
             GLES20.glVertexAttribPointer(distLoc, 1, GLES20.GL_FLOAT, false, stride, meshBuffer)
 
@@ -571,6 +561,13 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             GLES20.glUniform3f(GLES20.glGetUniformLocation(frontProgram, "uPaperColor"), pr, pg, pb)
             GLES20.glUniform1f(GLES20.glGetUniformLocation(frontProgram, "uRadius"), curlRadius)
 
+            // Pass 2：只画正面（d <= HALF_PI * R）
+            GLES20.glUniform1i(passLoc, 0)
+            indexBuffer.position(0)
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, indexCount, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
+
+            // Pass 3：只画翻折后的背面（d > HALF_PI * R），永远严格覆盖在正面之上
+            GLES20.glUniform1i(passLoc, 1)
             indexBuffer.position(0)
             GLES20.glDrawElements(GLES20.GL_TRIANGLES, indexCount, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
 
@@ -584,28 +581,53 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         private fun buildCylinderMesh(
             touchX: Float,
             touchY: Float,
-            cornerX: Float,
             cornerY: Float,
             aspect: Float
         ) {
-            val tx = touchX / curlH
-            val ty = 1f - touchY / curlH
-            val cx = if (cornerX <= 0f) 0f else aspect
+            // 世界坐标系: x in [0, aspect] (左侧书脊为 0，右侧页边为 aspect), y in [0, 1] (底为 0，顶为 1)
+            var tx = touchX / curlH
+            var ty = 1f - touchY / curlH
+            val cx = aspect
             val cy = if (cornerY <= 0f) 1f else 0f
 
+            // === 物理书脊装订约束（固定左边 x=0 这条边，杜绝上下对折）===
+            // 1. 当手指在右侧书页区域（tx > 0）时，书页右下角/右上角到左侧对应书脊端点 (0, cy) 的距离物理上不可超过页宽 aspect
+            ty = min(max(ty, 0f), 1f)
+            if (tx > 0f) {
+                val spineDx = tx
+                val spineDy = ty - cy
+                val spineDist = hypot(spineDx.toDouble(), spineDy.toDouble()).toFloat()
+                val maxLen = aspect * 0.992f
+                if (spineDist > maxLen && spineDist > 0.0001f) {
+                    val scale = maxLen / spineDist
+                    tx = spineDx * scale
+                    ty = cy + spineDy * scale
+                }
+            }
+
+            // 2. 计算翻页方向向量，并限制最大倾角，防止折痕变水平导致上下对折
             var dx = cx - tx
             var dy = cy - ty
-            val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-            val safeDist = max(dist, 0.0005f)
-            dx /= safeDist
-            dy /= safeDist
+            if (dx < 0.001f) dx = 0.001f
 
-            val progress = min(max(dist / (aspect * 2.0f), 0f), 1f)
-            val r = 0.052f + 0.056f * sin(progress * PI).toFloat()
+            // 随翻页进度越靠近左侧书脊，垂直倾角平滑归零（自然贴合书脊翻过去）
+            val leftProgress = min(max((aspect - tx) / (aspect * 2.0f), 0f), 1f)
+            val maxSlope = 0.42f * (1f - min(leftProgress * 1.15f, 1f))
+            if (abs(dy) > dx * maxSlope) {
+                dy = sign(dy) * dx * maxSlope
+            }
+
+            val normLen = max(hypot(dx.toDouble(), dy.toDouble()).toFloat(), 0.0005f)
+            dx /= normLen
+            dy /= normLen
+
+            // 3. 动态圆柱半径：拉起初期紧致，中段舒展
+            val r = 0.048f + 0.056f * sin(leftProgress * PI).toFloat()
             val halfCirc = (PI * r).toFloat()
 
-            val ax = (tx + cx) * 0.5f - dx * (r * 0.35f)
-            val ay = (ty + cy) * 0.5f - dy * (r * 0.35f)
+            // 4. 折痕轴基准点：随手指线性推进，当 tx = -aspect 时整页完全平顺翻出左侧屏幕
+            val ax = (tx + cx) * 0.5f - dx * (r * 0.25f)
+            val ay = (ty + cy) * 0.5f - dy * (r * 0.25f)
 
             axisAx = ax
             axisAy = ay
@@ -624,23 +646,19 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                     val d = (px - ax) * dx + (py - ay) * dy
                     val outX: Float
                     val outY: Float
-                    val outZ: Float
 
                     when {
                         d <= 0f -> {
                             outX = px
                             outY = py
-                            outZ = 0f
                         }
 
                         d < halfCirc -> {
                             val theta = d / r
                             val sinT = sin(theta.toDouble()).toFloat()
-                            val cosT = cos(theta.toDouble()).toFloat()
                             val shift = r * sinT - d
                             outX = px + dx * shift
                             outY = py + dy * shift
-                            outZ = r * (1f - cosT)
                         }
 
                         else -> {
@@ -648,17 +666,14 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                             val shift = -(d + over)
                             outX = px + dx * shift
                             outY = py + dy * shift
-                            outZ = 2f * r
                         }
                     }
 
                     val ndcX = (outX / aspect) * 2f - 1f
                     val ndcY = outY * 2f - 1f
-                    val ndcZ = -outZ * 2.0f
 
                     meshFloats[idx++] = ndcX
                     meshFloats[idx++] = ndcY
-                    meshFloats[idx++] = ndcZ
                     meshFloats[idx++] = u
                     meshFloats[idx++] = v
                     meshFloats[idx++] = d
@@ -702,7 +717,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 varying vec2 vUv;
                 void main() {
                     vUv = aUv;
-                    gl_Position = vec4(aPos, 0.5, 1.0);
+                    gl_Position = vec4(aPos, 0.0, 1.0);
                 }
             """
 
@@ -730,7 +745,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             """
 
             private const val CURL_VERTEX_SHADER = """
-                attribute vec3 aPos;
+                attribute vec2 aPos;
                 attribute vec2 aUv;
                 attribute float aDist;
                 varying vec2 vUv;
@@ -738,7 +753,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 void main() {
                     vUv = aUv;
                     vDist = aDist;
-                    gl_Position = vec4(aPos, 1.0);
+                    gl_Position = vec4(aPos, 0.0, 1.0);
                 }
             """
 
@@ -747,46 +762,44 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 uniform sampler2D uTex;
                 uniform vec3 uPaperColor;
                 uniform float uRadius;
+                uniform int uPass;
                 varying vec2 vUv;
                 varying float vDist;
                 void main() {
                     const float PI = 3.14159265;
                     const float HALF_PI = 1.57079633;
+                    float quarterCirc = HALF_PI * uRadius;
                     float halfCirc = PI * uRadius;
-                    vec4 texCol = texture2D(uTex, vUv);
 
-                    float shade = 1.0;
-                    float backMix = 0.0;
-
-                    if (vDist <= 0.0) {
-                        shade = 1.0;
-                        backMix = 0.0;
-                    } else if (vDist < halfCirc) {
-                        float theta = vDist / uRadius;
-                        if (theta < HALF_PI) {
-                            // 正面卷起弧面：在 theta=0 处严格为 1.0（与平面零接缝），平滑微暗至卷边
+                    if (uPass == 0) {
+                        // 正面 Pass：丢弃已翻折到背面的片元
+                        if (vDist > quarterCirc) discard;
+                        vec4 texCol = texture2D(uTex, vUv);
+                        float shade = 1.0;
+                        if (vDist > 0.0) {
+                            float theta = vDist / uRadius;
                             float c = cos(theta);
                             float s = sin(theta);
                             shade = 0.90 + 0.10 * c + 0.025 * s;
-                            backMix = 0.0;
-                        } else {
-                            // 背面卷起弧面：在 theta=PI/2 与 theta=PI 处均平滑衔接至 0.88，中段微亮
-                            float t = (theta - HALF_PI) / HALF_PI;
-                            backMix = smoothstep(HALF_PI, HALF_PI + 0.08, theta);
-                            shade = 0.88 + 0.07 * sin(t * PI);
                         }
+                        gl_FragColor = vec4(texCol.rgb * shade, 1.0);
                     } else {
-                        // 翻折后的背面平整区域：在 over=0 处严格为 0.88（零接缝），向外平滑恢复到 0.98
-                        float over = vDist - halfCirc;
-                        backMix = 1.0;
-                        float foldShadow = exp(-over / max(uRadius * 1.25, 0.035));
-                        shade = 0.98 - 0.10 * foldShadow;
+                        // 背面 Pass：只绘制已翻折到背面的片元，严格盖在正面之上
+                        if (vDist <= quarterCirc) discard;
+                        vec4 texCol = texture2D(uTex, vUv);
+                        float shade;
+                        if (vDist < halfCirc) {
+                            float theta = vDist / uRadius;
+                            float t = (theta - HALF_PI) / HALF_PI;
+                            shade = 0.88 + 0.07 * sin(t * PI);
+                        } else {
+                            float over = vDist - halfCirc;
+                            float foldShadow = exp(-over / max(uRadius * 1.25, 0.035));
+                            shade = 0.98 - 0.10 * foldShadow;
+                        }
+                        vec3 backCol = mix(texCol.rgb, uPaperColor, 0.78);
+                        gl_FragColor = vec4(backCol * shade, 1.0);
                     }
-
-                    // 掌阅风格背面透字：78% 纸张底色 + 22% 镜像原页文字
-                    vec3 backCol = mix(texCol.rgb, uPaperColor, 0.78);
-                    vec3 finalRgb = mix(texCol.rgb, backCol, backMix);
-                    gl_FragColor = vec4(finalRgb * shade, 1.0);
                 }
             """
         }
