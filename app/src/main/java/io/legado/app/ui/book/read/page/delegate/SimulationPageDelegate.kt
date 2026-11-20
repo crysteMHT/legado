@@ -4,11 +4,19 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.PixelFormat
+import android.graphics.SurfaceTexture
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLSurface
 import android.opengl.GLES20
-import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
+import android.os.Handler
+import android.os.HandlerThread
 import android.view.MotionEvent
+import android.view.TextureView
+import android.view.View
 import android.widget.FrameLayout
 import io.legado.app.help.config.ReadBookConfig
 import io.legado.app.ui.book.read.page.ReadView
@@ -18,10 +26,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
-import javax.microedition.khronos.egl.EGLConfig
-import javax.microedition.khronos.opengles.GL10
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
@@ -29,11 +34,10 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * 基于 OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（掌阅/iBooks 风格）。
- * 特点：
- * 1. 零第三方依赖，直接替换 Legado 原生 SimulationPageDelegate.kt 即可编译；
- * 2. 动静分离：静止阅读时将 GL 视图移出屏幕外保持 EGL 上下文常驻（首帧不闪黑，不影响长按选词与菜单）；
- * 3. 3D 圆柱体卷页 + 背面半透明透字 + 内外双层柔和阴影，全程 GPU 加速渲染。
+ * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v2 修复版）。
+ * 修复内容：
+ * 1. 改用 TextureView + EGL14 替代 GLSurfaceView，彻底解决翻页结束后黑屏/遮挡菜单的问题；
+ * 2. 加密 3D 网格至 64x48，并将光照、正反面过渡与内外折痕阴影改为片元着色器逐像素连续计算，消除锯齿与生硬灰带。
  */
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
@@ -45,12 +49,12 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     private var nextBitmap: Bitmap? = null
     private val screenshotCanvas = Canvas()
 
-    private val glView: PageCurlGLView = PageCurlGLView(readView.context).apply {
+    private val glView: PageCurlTextureView = PageCurlTextureView(readView.context).apply {
         layoutParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
-        translationX = 10000f
+        visibility = View.INVISIBLE
     }
 
     private var glActive = false
@@ -79,9 +83,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
     override fun setViewSize(width: Int, height: Int) {
         super.setViewSize(width, height)
-        if (!glActive && width > 0) {
-            glView.translationX = width * 2f + 100f
-        }
     }
 
     override fun onTouch(event: MotionEvent) {
@@ -189,6 +190,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     override fun onDestroy() {
         super.onDestroy()
         hideGL()
+        glView.release()
         readView.removeView(glView)
         curBitmap?.recycle()
         prevBitmap?.recycle()
@@ -201,15 +203,15 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     private fun showGL() {
         if (!glActive) {
             glActive = true
-            glView.translationX = 0f
             glView.bringToFront()
+            glView.visibility = View.VISIBLE
         }
     }
 
     private fun hideGL() {
-        if (glActive) {
+        if (glActive || glView.visibility == View.VISIBLE) {
             glActive = false
-            glView.translationX = max(viewWidth * 2f, 2000f) + 100f
+            glView.visibility = View.INVISIBLE
         }
     }
 
@@ -219,23 +221,24 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     }
 
     /**
-     * 内置 OpenGL ES 2.0 3D 圆柱体卷页渲染视图（无需任何外部库）
+     * 基于 TextureView + EGL14 的 3D 圆柱体卷页渲染视图。
+     * 作为普通 View 参与窗口合成，INVISIBLE 时彻底透明且保持 EGL 上下文存活，绝不黑屏、不闪黑。
      */
-    private class PageCurlGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Renderer {
+    private class PageCurlTextureView(context: Context) : TextureView(context),
+        TextureView.SurfaceTextureListener {
 
-        private val cols = 36
-        private val rows = 24
+        private val cols = 64
+        private val rows = 48
         private val vertexCount = (cols + 1) * (rows + 1)
         private val indexCount = cols * rows * 6
 
-        // 每个顶点: x, y, z, u, v, shade, isBack (7 floats)
-        private val meshFloats = FloatArray(vertexCount * 7)
+        // 每个顶点: x, y, z, u, v, dist (6 floats)
+        private val meshFloats = FloatArray(vertexCount * 6)
         private val meshBuffer: FloatBuffer = ByteBuffer.allocateDirect(meshFloats.size * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer()
         private val indexBuffer: ShortBuffer = ByteBuffer.allocateDirect(indexCount * 2)
             .order(ByteOrder.nativeOrder()).asShortBuffer()
 
-        // 底层下一页全屏四边形: x, y, u, v (4 floats * 4 vertices)
         private val bgQuad = floatArrayOf(
             -1f, -1f, 0f, 1f,
              1f, -1f, 1f, 1f,
@@ -252,6 +255,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         @Volatile private var pendingTop: Bitmap? = null
         @Volatile private var pendingBottom: Bitmap? = null
         @Volatile private var dirtyTextures = false
+        @Volatile private var renderQueued = false
 
         private var bgR = 0.94f
         private var bgG = 0.91f
@@ -269,16 +273,30 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         private var axisNy = 0f
         private var curlRadius = 0.08f
 
+        private var surfaceW = 1
+        private var surfaceH = 1
+
+        private val glThread = HandlerThread("LegadoPageCurlGL").apply { start() }
+        private val glHandler = Handler(glThread.looper)
+
+        private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
+        private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+        private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+        private var glReady = false
+
         private var texTop = 0
         private var texBottom = 0
         private var frontProgram = 0
         private var bgProgram = 0
 
+        private val drawRunnable = Runnable {
+            renderQueued = false
+            drawFrameOnGL()
+        }
+
         init {
-            setEGLContextClientVersion(2)
-            setEGLConfigChooser(8, 8, 8, 8, 16, 0)
-            holder.setFormat(PixelFormat.TRANSLUCENT)
-            setZOrderMediaOverlay(true)
+            isOpaque = false
+            surfaceTextureListener = this
 
             val indices = ShortArray(indexCount)
             var ptr = 0
@@ -298,9 +316,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             }
             indexBuffer.put(indices)
             indexBuffer.position(0)
-
-            setRenderer(this)
-            renderMode = RENDERMODE_WHEN_DIRTY
         }
 
         fun setPages(top: Bitmap?, bottom: Bitmap?, paperColor: Int) {
@@ -312,7 +327,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 bgG = Color.green(paperColor) / 255f
                 bgB = Color.blue(paperColor) / 255f
             }
-            requestRender()
+            scheduleRender()
         }
 
         fun updateCurl(
@@ -331,10 +346,88 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 curlW = max(viewW, 1f)
                 curlH = max(viewH, 1f)
             }
-            requestRender()
+            scheduleRender()
         }
 
-        override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        fun release() {
+            glHandler.post {
+                destroyEGL()
+                glThread.quitSafely()
+            }
+        }
+
+        private fun scheduleRender() {
+            if (!renderQueued && glThread.isAlive) {
+                renderQueued = true
+                glHandler.post(drawRunnable)
+            }
+        }
+
+        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+            surfaceW = max(width, 1)
+            surfaceH = max(height, 1)
+            glHandler.post {
+                initEGL(surface)
+                drawFrameOnGL()
+            }
+        }
+
+        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+            surfaceW = max(width, 1)
+            surfaceH = max(height, 1)
+            glHandler.post {
+                if (glReady) {
+                    GLES20.glViewport(0, 0, surfaceW, surfaceH)
+                    drawFrameOnGL()
+                }
+            }
+        }
+
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+            glHandler.post { destroyEGL() }
+            return true
+        }
+
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+
+        private fun initEGL(surfaceTexture: SurfaceTexture) {
+            destroyEGL()
+            eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY) return
+
+            val version = IntArray(2)
+            if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) return
+
+            val attribList = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8,
+                EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_DEPTH_SIZE, 16,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_NONE
+            )
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val numConfigs = IntArray(1)
+            if (!EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, 1, numConfigs, 0) || numConfigs[0] <= 0) {
+                return
+            }
+            val config = configs[0] ?: return
+
+            val ctxAttribs = intArrayOf(
+                EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
+                EGL14.EGL_NONE
+            )
+            eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, ctxAttribs, 0)
+            if (eglContext == EGL14.EGL_NO_CONTEXT) return
+
+            val surfAttribs = intArrayOf(EGL14.EGL_NONE)
+            eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, config, surfaceTexture, surfAttribs, 0)
+            if (eglSurface == EGL14.EGL_NO_SURFACE) return
+
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return
+
+            GLES20.glViewport(0, 0, surfaceW, surfaceH)
             GLES20.glClearColor(0f, 0f, 0f, 0f)
             GLES20.glEnable(GLES20.GL_BLEND)
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
@@ -348,14 +441,36 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             texBottom = texIds[1]
             setupTexture(texTop)
             setupTexture(texBottom)
+
             dirtyTextures = true
+            glReady = true
         }
 
-        override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-            GLES20.glViewport(0, 0, width, height)
+        private fun destroyEGL() {
+            glReady = false
+            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                EGL14.eglMakeCurrent(
+                    eglDisplay,
+                    EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_CONTEXT
+                )
+                if (eglSurface != EGL14.EGL_NO_SURFACE) {
+                    EGL14.eglDestroySurface(eglDisplay, eglSurface)
+                }
+                if (eglContext != EGL14.EGL_NO_CONTEXT) {
+                    EGL14.eglDestroyContext(eglDisplay, eglContext)
+                }
+                EGL14.eglTerminate(eglDisplay)
+            }
+            eglDisplay = EGL14.EGL_NO_DISPLAY
+            eglContext = EGL14.EGL_NO_CONTEXT
+            eglSurface = EGL14.EGL_NO_SURFACE
         }
 
-        override fun onDrawFrame(gl: GL10?) {
+        private fun drawFrameOnGL() {
+            if (!glReady) return
+
             val topBmp: Bitmap?
             val bottomBmp: Bitmap?
             val needUpload: Boolean
@@ -397,12 +512,15 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             }
 
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-            if (topBmp == null || bottomBmp == null) return
+            if (topBmp == null || bottomBmp == null) {
+                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+                return
+            }
 
             val aspect = w / h
-            buildCylinderMesh(tx, ty, cx, cy, w, h, aspect)
+            buildCylinderMesh(tx, ty, cx, cy, aspect)
 
-            // 1. 绘制底层下一页 + 卷起页投射的柔和外阴影
+            // 1. 底层下一页 + 柔和外投影
             GLES20.glDisable(GLES20.GL_DEPTH_TEST)
             GLES20.glUseProgram(bgProgram)
             val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPos")
@@ -425,16 +543,15 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             GLES20.glDisableVertexAttribArray(bgPosLoc)
             GLES20.glDisableVertexAttribArray(bgUvLoc)
 
-            // 2. 绘制上层 3D 圆柱卷曲书页（正面 + 背面透字 + 曲面明暗）
+            // 2. 上层 3D 圆柱卷曲书页（逐像素连续光照 + 背面透字）
             GLES20.glEnable(GLES20.GL_DEPTH_TEST)
             GLES20.glDepthFunc(GLES20.GL_LEQUAL)
             GLES20.glUseProgram(frontProgram)
 
-            val stride = 7 * 4
+            val stride = 6 * 4
             val posLoc = GLES20.glGetAttribLocation(frontProgram, "aPos")
             val uvLoc = GLES20.glGetAttribLocation(frontProgram, "aUv")
-            val shadeLoc = GLES20.glGetAttribLocation(frontProgram, "aShade")
-            val backLoc = GLES20.glGetAttribLocation(frontProgram, "aIsBack")
+            val distLoc = GLES20.glGetAttribLocation(frontProgram, "aDist")
 
             meshBuffer.position(0)
             GLES20.glEnableVertexAttribArray(posLoc)
@@ -445,25 +562,23 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, stride, meshBuffer)
 
             meshBuffer.position(5)
-            GLES20.glEnableVertexAttribArray(shadeLoc)
-            GLES20.glVertexAttribPointer(shadeLoc, 1, GLES20.GL_FLOAT, false, stride, meshBuffer)
-
-            meshBuffer.position(6)
-            GLES20.glEnableVertexAttribArray(backLoc)
-            GLES20.glVertexAttribPointer(backLoc, 1, GLES20.GL_FLOAT, false, stride, meshBuffer)
+            GLES20.glEnableVertexAttribArray(distLoc)
+            GLES20.glVertexAttribPointer(distLoc, 1, GLES20.GL_FLOAT, false, stride, meshBuffer)
 
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texTop)
             GLES20.glUniform1i(GLES20.glGetUniformLocation(frontProgram, "uTex"), 0)
             GLES20.glUniform3f(GLES20.glGetUniformLocation(frontProgram, "uPaperColor"), pr, pg, pb)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(frontProgram, "uRadius"), curlRadius)
 
             indexBuffer.position(0)
             GLES20.glDrawElements(GLES20.GL_TRIANGLES, indexCount, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
 
             GLES20.glDisableVertexAttribArray(posLoc)
             GLES20.glDisableVertexAttribArray(uvLoc)
-            GLES20.glDisableVertexAttribArray(shadeLoc)
-            GLES20.glDisableVertexAttribArray(backLoc)
+            GLES20.glDisableVertexAttribArray(distLoc)
+
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
         }
 
         private fun buildCylinderMesh(
@@ -471,13 +586,10 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             touchY: Float,
             cornerX: Float,
             cornerY: Float,
-            w: Float,
-            h: Float,
             aspect: Float
         ) {
-            // 转换到以屏幕高度为 1.0 的世界坐标系: x in [0, aspect], y in [0, 1] (底为0，顶为1)
-            val tx = touchX / h
-            val ty = 1f - touchY / h
+            val tx = touchX / curlH
+            val ty = 1f - touchY / curlH
             val cx = if (cornerX <= 0f) 0f else aspect
             val cy = if (cornerY <= 0f) 1f else 0f
 
@@ -488,13 +600,10 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             dx /= safeDist
             dy /= safeDist
 
-            // 限制翻页角度不过度竖直，保持自然书页装订手感
             val progress = min(max(dist / (aspect * 2.0f), 0f), 1f)
-            // 动态圆柱半径：拉起初期紧致，中段舒展（接近掌阅风格）
-            val r = 0.055f + 0.058f * sin(progress * PI).toFloat()
+            val r = 0.052f + 0.056f * sin(progress * PI).toFloat()
             val halfCirc = (PI * r).toFloat()
 
-            // 折痕轴基准点（位于手指与页角之间，使翻起边缘紧贴手指）
             val ax = (tx + cx) * 0.5f - dx * (r * 0.35f)
             val ay = (ty + cy) * 0.5f - dy * (r * 0.35f)
 
@@ -506,28 +615,22 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
             var idx = 0
             for (row in 0..rows) {
-                val v = row.toFloat() / rows // 0 = top, 1 = bottom
+                val v = row.toFloat() / rows
                 val py = 1f - v
                 for (col in 0..cols) {
                     val u = col.toFloat() / cols
                     val px = u * aspect
 
                     val d = (px - ax) * dx + (py - ay) * dy
-                    var outX: Float
-                    var outY: Float
-                    var outZ: Float
-                    var shade: Float
-                    var isBack: Float
+                    val outX: Float
+                    val outY: Float
+                    val outZ: Float
 
                     when {
                         d <= 0f -> {
                             outX = px
                             outY = py
                             outZ = 0f
-                            // 靠近卷起折痕处做极柔和的微暗过渡
-                            val edgeProx = max(0f, 1f + d / (r * 0.6f))
-                            shade = 1f - 0.04f * edgeProx
-                            isBack = 0f
                         }
 
                         d < halfCirc -> {
@@ -538,10 +641,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                             outX = px + dx * shift
                             outY = py + dy * shift
                             outZ = r * (1f - cosT)
-                            // 圆柱曲面立体明暗：外侧微微提亮，内折处渐变加深
-                            val light = 0.80f + 0.22f * sinT
-                            shade = min(max(light, 0.72f), 1.03f)
-                            isBack = if (theta > (PI * 0.5).toFloat()) 1f else 0f
                         }
 
                         else -> {
@@ -550,14 +649,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                             outX = px + dx * shift
                             outY = py + dy * shift
                             outZ = 2f * r
-                            // 背面靠近折痕一侧保留内折阴影
-                            val foldDark = max(0f, 1f - over / (r * 1.4f))
-                            shade = 0.96f - 0.14f * foldDark
-                            isBack = 1f
                         }
                     }
 
-                    // 映射回 OpenGL NDC [-1, 1]，z 越大越靠前（映射到 [-0.9, 0.0] 配合 GL_LEQUAL）
                     val ndcX = (outX / aspect) * 2f - 1f
                     val ndcY = outY * 2f - 1f
                     val ndcZ = -outZ * 2.0f
@@ -567,8 +661,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                     meshFloats[idx++] = ndcZ
                     meshFloats[idx++] = u
                     meshFloats[idx++] = v
-                    meshFloats[idx++] = shade
-                    meshFloats[idx++] = isBack
+                    meshFloats[idx++] = d
                 }
             }
 
@@ -614,7 +707,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             """
 
             private const val BG_FRAGMENT_SHADER = """
-                precision mediump float;
+                precision highp float;
                 uniform sampler2D uTex;
                 uniform vec2 uAxisA;
                 uniform vec2 uAxisN;
@@ -625,11 +718,12 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                     vec4 col = texture2D(uTex, vUv);
                     vec2 worldP = vec2(vUv.x * uAspect, 1.0 - vUv.y);
                     float d = dot(worldP - uAxisA, uAxisN);
-                    float shadowWidth = max(uRadius * 2.2, 0.06);
+                    float shadowW = max(uRadius * 1.9, 0.045);
                     float s = 1.0;
-                    if (d > -0.02) {
-                        float t = clamp((d + 0.02) / shadowWidth, 0.0, 1.0);
-                        s = mix(0.62, 1.0, t * t * (3.0 - 2.0 * t));
+                    if (d > -0.008) {
+                        float fadeIn = smoothstep(-0.008, 0.012, d);
+                        float drop = exp(-max(d, 0.0) / shadowW);
+                        s = 1.0 - 0.22 * fadeIn * drop;
                     }
                     gl_FragColor = vec4(col.rgb * s, 1.0);
                 }
@@ -638,32 +732,61 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             private const val CURL_VERTEX_SHADER = """
                 attribute vec3 aPos;
                 attribute vec2 aUv;
-                attribute float aShade;
-                attribute float aIsBack;
+                attribute float aDist;
                 varying vec2 vUv;
-                varying float vShade;
-                varying float vIsBack;
+                varying float vDist;
                 void main() {
                     vUv = aUv;
-                    vShade = aShade;
-                    vIsBack = aIsBack;
+                    vDist = aDist;
                     gl_Position = vec4(aPos, 1.0);
                 }
             """
 
             private const val CURL_FRAGMENT_SHADER = """
-                precision mediump float;
+                precision highp float;
                 uniform sampler2D uTex;
                 uniform vec3 uPaperColor;
+                uniform float uRadius;
                 varying vec2 vUv;
-                varying float vShade;
-                varying float vIsBack;
+                varying float vDist;
                 void main() {
+                    const float PI = 3.14159265;
+                    const float HALF_PI = 1.57079633;
+                    float halfCirc = PI * uRadius;
                     vec4 texCol = texture2D(uTex, vUv);
-                    // 背面透字：将镜像后的书页纹理与纸张底色混合（0.72 还原掌阅透印感）
-                    vec3 backCol = mix(texCol.rgb, uPaperColor, 0.72);
-                    vec3 finalRgb = mix(texCol.rgb, backCol, step(0.5, vIsBack));
-                    gl_FragColor = vec4(finalRgb * vShade, 1.0);
+
+                    float shade = 1.0;
+                    float backMix = 0.0;
+
+                    if (vDist <= 0.0) {
+                        shade = 1.0;
+                        backMix = 0.0;
+                    } else if (vDist < halfCirc) {
+                        float theta = vDist / uRadius;
+                        if (theta < HALF_PI) {
+                            // 正面卷起弧面：在 theta=0 处严格为 1.0（与平面零接缝），平滑微暗至卷边
+                            float c = cos(theta);
+                            float s = sin(theta);
+                            shade = 0.90 + 0.10 * c + 0.025 * s;
+                            backMix = 0.0;
+                        } else {
+                            // 背面卷起弧面：在 theta=PI/2 与 theta=PI 处均平滑衔接至 0.88，中段微亮
+                            float t = (theta - HALF_PI) / HALF_PI;
+                            backMix = smoothstep(HALF_PI, HALF_PI + 0.08, theta);
+                            shade = 0.88 + 0.07 * sin(t * PI);
+                        }
+                    } else {
+                        // 翻折后的背面平整区域：在 over=0 处严格为 0.88（零接缝），向外平滑恢复到 0.98
+                        float over = vDist - halfCirc;
+                        backMix = 1.0;
+                        float foldShadow = exp(-over / max(uRadius * 1.25, 0.035));
+                        shade = 0.98 - 0.10 * foldShadow;
+                    }
+
+                    // 掌阅风格背面透字：78% 纸张底色 + 22% 镜像原页文字
+                    vec3 backCol = mix(texCol.rgb, uPaperColor, 0.78);
+                    vec3 finalRgb = mix(texCol.rgb, backCol, backMix);
+                    gl_FragColor = vec4(finalRgb * shade, 1.0);
                 }
             """
         }
