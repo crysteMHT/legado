@@ -290,6 +290,5 @@ dependencies {
     //com.github.AmrDeveloper:CodeView代码编辑已集成到应用内
     //epubLib集成到应用内
 
-    //三维仿真翻页
-    implementation 'com.github.eschao:android-PageFlip:1.0.2'
+
 }
