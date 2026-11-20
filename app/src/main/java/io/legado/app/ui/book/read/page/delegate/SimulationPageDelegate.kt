@@ -1,156 +1,76 @@
 package io.legado.app.ui.book.read.page.delegate
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.PointF
-import android.graphics.Region
-import android.graphics.drawable.GradientDrawable
-import android.os.Build
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.opengl.GLES20
+import android.opengl.GLSurfaceView
+import android.opengl.GLUtils
 import android.view.MotionEvent
+import android.widget.FrameLayout
 import io.legado.app.help.config.ReadBookConfig
 import io.legado.app.ui.book.read.page.ReadView
 import io.legado.app.ui.book.read.page.entities.PageDirection
 import io.legado.app.utils.screenshot
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.nio.ShortBuffer
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
+import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
-@Suppress("DEPRECATION")
+/**
+ * 基于 OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（掌阅/iBooks 风格）。
+ * 特点：
+ * 1. 零第三方依赖，直接替换 Legado 原生 SimulationPageDelegate.kt 即可编译；
+ * 2. 动静分离：静止阅读时将 GL 视图移出屏幕外保持 EGL 上下文常驻（首帧不闪黑，不影响长按选词与菜单）；
+ * 3. 3D 圆柱体卷页 + 背面半透明透字 + 内外双层柔和阴影，全程 GPU 加速渲染。
+ */
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
-    //不让x,y为0,否则在点计算时会有问题
-    private var mTouchX = 0.1f
-    private var mTouchY = 0.1f
 
-    // 拖拽点对应的页脚
     private var mCornerX = 1
     private var mCornerY = 1
-    private val mPath0: Path = Path()
-    private val mPath1: Path = Path()
-
-    // 贝塞尔曲线起始点
-    private val mBezierStart1 = PointF()
-
-    // 贝塞尔曲线控制点
-    private val mBezierControl1 = PointF()
-
-    // 贝塞尔曲线顶点
-    private val mBezierVertex1 = PointF()
-
-    // 贝塞尔曲线结束点
-    private var mBezierEnd1 = PointF()
-
-    // 另一条贝塞尔曲线
-    // 贝塞尔曲线起始点
-    private val mBezierStart2 = PointF()
-
-    // 贝塞尔曲线控制点
-    private val mBezierControl2 = PointF()
-
-    // 贝塞尔曲线顶点
-    private val mBezierVertex2 = PointF()
-
-    // 贝塞尔曲线结束点
-    private var mBezierEnd2 = PointF()
-
-    private var mMiddleX = 0f
-    private var mMiddleY = 0f
-    private var mDegrees = 0f
-    private var mTouchToCornerDis = 0f
-    private var mColorMatrixFilter = ColorMatrixColorFilter(
-        ColorMatrix(
-            floatArrayOf(
-                1f, 0f, 0f, 0f, 0f,
-                0f, 1f, 0f, 0f, 0f,
-                0f, 0f, 1f, 0f, 0f,
-                0f, 0f, 0f, 1f, 0f
-            )
-        )
-    )
-    private val mMatrix: Matrix = Matrix()
-    private val mMatrixArray = floatArrayOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 1f)
-
-    // 是否属于右上左下
-    private var mIsRtOrLb = false
-    private var mMaxLength = hypot(viewWidth.toDouble(), viewHeight.toDouble()).toFloat()
-
-    // 背面颜色组
-    private var mBackShadowColors: IntArray
-
-    // 前面颜色组
-    private var mFrontShadowColors: IntArray
-
-    // 有阴影的GradientDrawable
-    private var mBackShadowDrawableLR: GradientDrawable
-    private var mBackShadowDrawableRL: GradientDrawable
-    private var mFolderShadowDrawableLR: GradientDrawable
-    private var mFolderShadowDrawableRL: GradientDrawable
-
-    private var mFrontShadowDrawableHBT: GradientDrawable
-    private var mFrontShadowDrawableHTB: GradientDrawable
-    private var mFrontShadowDrawableVLR: GradientDrawable
-    private var mFrontShadowDrawableVRL: GradientDrawable
-
-    private val mPaint: Paint = Paint().apply { style = Paint.Style.FILL }
 
     private var curBitmap: Bitmap? = null
     private var prevBitmap: Bitmap? = null
     private var nextBitmap: Bitmap? = null
-    private var canvas: Canvas = Canvas()
+    private val screenshotCanvas = Canvas()
+
+    private val glView: PageCurlGLView = PageCurlGLView(readView.context).apply {
+        layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        translationX = 10000f
+    }
+
+    private var glActive = false
 
     init {
-        //设置颜色数组
-        val color = intArrayOf(0x333333, -0x4fcccccd)
-        mFolderShadowDrawableRL = GradientDrawable(GradientDrawable.Orientation.RIGHT_LEFT, color)
-        mFolderShadowDrawableRL.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mFolderShadowDrawableLR = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, color)
-        mFolderShadowDrawableLR.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mBackShadowColors = intArrayOf(-0xeeeeef, 0x111111)
-        mBackShadowDrawableRL =
-            GradientDrawable(GradientDrawable.Orientation.RIGHT_LEFT, mBackShadowColors)
-        mBackShadowDrawableRL.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mBackShadowDrawableLR =
-            GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, mBackShadowColors)
-        mBackShadowDrawableLR.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mFrontShadowColors = intArrayOf(-0x7feeeeef, 0x111111)
-        mFrontShadowDrawableVLR =
-            GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, mFrontShadowColors)
-        mFrontShadowDrawableVLR.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mFrontShadowDrawableVRL =
-            GradientDrawable(GradientDrawable.Orientation.RIGHT_LEFT, mFrontShadowColors)
-        mFrontShadowDrawableVRL.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mFrontShadowDrawableHTB =
-            GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, mFrontShadowColors)
-        mFrontShadowDrawableHTB.gradientType = GradientDrawable.LINEAR_GRADIENT
-
-        mFrontShadowDrawableHBT =
-            GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, mFrontShadowColors)
-        mFrontShadowDrawableHBT.gradientType = GradientDrawable.LINEAR_GRADIENT
+        readView.addView(glView)
     }
 
     override fun setBitmap() {
         when (mDirection) {
             PageDirection.PREV -> {
-                prevBitmap = prevPage.screenshot(prevBitmap, canvas)
-                curBitmap = curPage.screenshot(curBitmap, canvas)
+                prevBitmap = prevPage.screenshot(prevBitmap, screenshotCanvas)
+                curBitmap = curPage.screenshot(curBitmap, screenshotCanvas)
+                glView.setPages(prevBitmap, curBitmap, ReadBookConfig.bgMeanColor)
             }
 
             PageDirection.NEXT -> {
-                nextBitmap = nextPage.screenshot(nextBitmap, canvas)
-                curBitmap = curPage.screenshot(curBitmap, canvas)
+                nextBitmap = nextPage.screenshot(nextBitmap, screenshotCanvas)
+                curBitmap = curPage.screenshot(curBitmap, screenshotCanvas)
+                glView.setPages(curBitmap, nextBitmap, ReadBookConfig.bgMeanColor)
             }
 
             else -> Unit
@@ -159,7 +79,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
     override fun setViewSize(width: Int, height: Int) {
         super.setViewSize(width, height)
-        mMaxLength = hypot(viewWidth.toDouble(), viewHeight.toDouble()).toFloat()
+        if (!glActive && width > 0) {
+            glView.translationX = width * 2f + 100f
+        }
     }
 
     override fun onTouch(event: MotionEvent) {
@@ -175,7 +97,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 ) {
                     readView.touchY = viewHeight.toFloat()
                 }
-
                 if (startY > viewHeight / 3 && startY < viewHeight / 2
                     && mDirection == PageDirection.NEXT
                 ) {
@@ -188,18 +109,19 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     override fun setDirection(direction: PageDirection) {
         super.setDirection(direction)
         when (direction) {
-            PageDirection.PREV ->
-                //上一页滑动不出现对角
+            PageDirection.PREV -> {
                 if (startX > viewWidth / 2) {
                     calcCornerXY(startX, viewHeight.toFloat())
                 } else {
                     calcCornerXY(viewWidth - startX, viewHeight.toFloat())
                 }
+            }
 
-            PageDirection.NEXT ->
+            PageDirection.NEXT -> {
                 if (viewWidth / 2 > startX) {
                     calcCornerXY(viewWidth - startX, startY)
                 }
+            }
 
             else -> Unit
         }
@@ -208,7 +130,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     override fun onAnimStart(animationSpeed: Int) {
         var dx: Float
         val dy: Float
-        // dy 垂直方向滑动的距离，负值会使滚动向上滚动
         if (isCancel) {
             dx = if (mCornerX > 0 && mDirection == PageDirection.NEXT) {
                 (viewWidth - touchX)
@@ -221,7 +142,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             dy = if (mCornerY > 0) {
                 (viewHeight - touchY)
             } else {
-                -touchY // 防止mTouchY最终变为0
+                -touchY
             }
         } else {
             dx = if (mCornerX > 0 && mDirection == PageDirection.NEXT) {
@@ -232,7 +153,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             dy = if (mCornerY > 0) {
                 (viewHeight - touchY)
             } else {
-                (1 - touchY) // 防止mTouchY最终变为0
+                (1 - touchY)
             }
         }
         startScroll(touchX.toInt(), touchY.toInt(), dx.toInt(), dy.toInt(), animationSpeed)
@@ -242,372 +163,509 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         if (!isCancel) {
             readView.fillPage(mDirection)
         }
+        hideGL()
     }
 
     override fun onDraw(canvas: Canvas) {
-        if (!isRunning) return
-        when (mDirection) {
-            PageDirection.NEXT -> {
-                calcPoints()
-                drawCurrentPageArea(canvas, curBitmap)
-                drawNextPageAreaAndShadow(canvas, nextBitmap)
-                drawCurrentPageShadow(canvas)
-                drawCurrentBackArea(canvas, curBitmap)
-            }
-
-            PageDirection.PREV -> {
-                calcPoints()
-                drawCurrentPageArea(canvas, prevBitmap)
-                drawNextPageAreaAndShadow(canvas, curBitmap)
-                drawCurrentPageShadow(canvas)
-                drawCurrentBackArea(canvas, prevBitmap)
-            }
-
-            else -> return
+        if (!isRunning) {
+            hideGL()
+            return
         }
-    }
-
-    /**
-     * 绘制翻起页背面
-     */
-    private fun drawCurrentBackArea(
-        canvas: Canvas,
-        bitmap: Bitmap?
-    ) {
-        bitmap ?: return
-        val i = ((mBezierStart1.x + mBezierControl1.x) / 2).toInt()
-        val f1 = abs(i - mBezierControl1.x)
-        val i1 = ((mBezierStart2.y + mBezierControl2.y) / 2).toInt()
-        val f2 = abs(i1 - mBezierControl2.y)
-        val f3 = min(f1, f2)
-        mPath1.reset()
-        mPath1.moveTo(mBezierVertex2.x, mBezierVertex2.y)
-        mPath1.lineTo(mBezierVertex1.x, mBezierVertex1.y)
-        mPath1.lineTo(mBezierEnd1.x, mBezierEnd1.y)
-        mPath1.lineTo(mTouchX, mTouchY)
-        mPath1.lineTo(mBezierEnd2.x, mBezierEnd2.y)
-        mPath1.close()
-        val mFolderShadowDrawable: GradientDrawable
-        val left: Int
-        val right: Int
-        if (mIsRtOrLb) {
-            left = (mBezierStart1.x - 1).toInt()
-            right = (mBezierStart1.x + f3 + 1).toInt()
-            mFolderShadowDrawable = mFolderShadowDrawableLR
-        } else {
-            left = (mBezierStart1.x - f3 - 1).toInt()
-            right = (mBezierStart1.x + 1).toInt()
-            mFolderShadowDrawable = mFolderShadowDrawableRL
+        if (mDirection != PageDirection.NEXT && mDirection != PageDirection.PREV) {
+            hideGL()
+            return
         }
-        canvas.save()
-        canvas.clipPath(mPath0)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            canvas.clipPath(mPath1)
-        } else {
-            canvas.clipPath(mPath1, Region.Op.INTERSECT)
-        }
-
-        mPaint.colorFilter = mColorMatrixFilter
-        val dis = hypot(
-            mCornerX - mBezierControl1.x.toDouble(),
-            mBezierControl2.y - mCornerY.toDouble()
-        ).toFloat()
-        val f8 = (mCornerX - mBezierControl1.x) / dis
-        val f9 = (mBezierControl2.y - mCornerY) / dis
-        mMatrixArray[0] = 1 - 2 * f9 * f9
-        mMatrixArray[1] = 2 * f8 * f9
-        mMatrixArray[3] = mMatrixArray[1]
-        mMatrixArray[4] = 1 - 2 * f8 * f8
-        mMatrix.reset()
-        mMatrix.setValues(mMatrixArray)
-        mMatrix.preTranslate(-mBezierControl1.x, -mBezierControl1.y)
-        mMatrix.postTranslate(mBezierControl1.x, mBezierControl1.y)
-        canvas.drawColor(ReadBookConfig.bgMeanColor)
-        canvas.drawBitmap(bitmap, mMatrix, mPaint)
-        mPaint.colorFilter = null
-        canvas.rotate(mDegrees, mBezierStart1.x, mBezierStart1.y)
-        mFolderShadowDrawable.setBounds(
-            left, mBezierStart1.y.toInt(),
-            right, (mBezierStart1.y + mMaxLength).toInt()
+        showGL()
+        glView.updateCurl(
+            touchX = touchX,
+            touchY = touchY,
+            cornerX = mCornerX.toFloat(),
+            cornerY = mCornerY.toFloat(),
+            viewW = viewWidth.toFloat(),
+            viewH = viewHeight.toFloat()
         )
-        mFolderShadowDrawable.draw(canvas)
-        canvas.restore()
     }
 
-    /**
-     * 绘制翻起页的阴影
-     */
-    private fun drawCurrentPageShadow(canvas: Canvas) {
-        val degree: Double = if (mIsRtOrLb) {
-            Math.PI / 4 - atan2(mBezierControl1.y - mTouchY, mTouchX - mBezierControl1.x)
-        } else {
-            Math.PI / 4 - atan2(mTouchY - mBezierControl1.y, mTouchX - mBezierControl1.x)
-        }
-        // 翻起页阴影顶点与touch点的距离
-        val d1 = 25.toFloat() * 1.414 * cos(degree)
-        val d2 = 25.toFloat() * 1.414 * sin(degree)
-        val x = (mTouchX + d1).toFloat()
-        val y: Float = if (mIsRtOrLb) {
-            (mTouchY + d2).toFloat()
-        } else {
-            (mTouchY - d2).toFloat()
-        }
-        mPath1.reset()
-        mPath1.moveTo(x, y)
-        mPath1.lineTo(mTouchX, mTouchY)
-        mPath1.lineTo(mBezierControl1.x, mBezierControl1.y)
-        mPath1.lineTo(mBezierStart1.x, mBezierStart1.y)
-        mPath1.close()
-        canvas.save()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            canvas.clipOutPath(mPath0)
-        } else {
-            canvas.clipPath(mPath0, Region.Op.XOR)
-        }
-        canvas.clipPath(mPath1, Region.Op.INTERSECT)
-
-        var leftX: Int
-        var rightX: Int
-        var mCurrentPageShadow: GradientDrawable
-        if (mIsRtOrLb) {
-            leftX = mBezierControl1.x.toInt()
-            rightX = (mBezierControl1.x + 25).toInt()
-            mCurrentPageShadow = mFrontShadowDrawableVLR
-        } else {
-            leftX = (mBezierControl1.x - 25).toInt()
-            rightX = (mBezierControl1.x + 1).toInt()
-            mCurrentPageShadow = mFrontShadowDrawableVRL
-        }
-        var rotateDegrees = Math.toDegrees(
-            atan2(mTouchX - mBezierControl1.x, mBezierControl1.y - mTouchY).toDouble()
-        ).toFloat()
-        canvas.rotate(rotateDegrees, mBezierControl1.x, mBezierControl1.y)
-        mCurrentPageShadow.setBounds(
-            leftX, (mBezierControl1.y - mMaxLength).toInt(),
-            rightX, mBezierControl1.y.toInt()
-        )
-        mCurrentPageShadow.draw(canvas)
-        canvas.restore()
-
-        mPath1.reset()
-        mPath1.moveTo(x, y)
-        mPath1.lineTo(mTouchX, mTouchY)
-        mPath1.lineTo(mBezierControl2.x, mBezierControl2.y)
-        mPath1.lineTo(mBezierStart2.x, mBezierStart2.y)
-        mPath1.close()
-        canvas.save()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            canvas.clipOutPath(mPath0)
-        } else {
-            canvas.clipPath(mPath0, Region.Op.XOR)
-        }
-        canvas.clipPath(mPath1)
-
-        if (mIsRtOrLb) {
-            leftX = mBezierControl2.y.toInt()
-            rightX = (mBezierControl2.y + 25).toInt()
-            mCurrentPageShadow = mFrontShadowDrawableHTB
-        } else {
-            leftX = (mBezierControl2.y - 25).toInt()
-            rightX = (mBezierControl2.y + 1).toInt()
-            mCurrentPageShadow = mFrontShadowDrawableHBT
-        }
-        rotateDegrees = Math.toDegrees(
-            atan2(mBezierControl2.y - mTouchY, mBezierControl2.x - mTouchX).toDouble()
-        ).toFloat()
-        canvas.rotate(rotateDegrees, mBezierControl2.x, mBezierControl2.y)
-        val temp =
-            if (mBezierControl2.y < 0) (mBezierControl2.y - viewHeight).toDouble()
-            else mBezierControl2.y.toDouble()
-        val hmg = hypot(mBezierControl2.x.toDouble(), temp)
-        if (hmg > mMaxLength)
-            mCurrentPageShadow.setBounds(
-                (mBezierControl2.x - 25 - hmg).toInt(), leftX,
-                (mBezierControl2.x + mMaxLength - hmg).toInt(), rightX
-            )
-        else
-            mCurrentPageShadow.setBounds(
-                (mBezierControl2.x - mMaxLength).toInt(), leftX,
-                mBezierControl2.x.toInt(), rightX
-            )
-        mCurrentPageShadow.draw(canvas)
-        canvas.restore()
+    override fun onDestroy() {
+        super.onDestroy()
+        hideGL()
+        readView.removeView(glView)
+        curBitmap?.recycle()
+        prevBitmap?.recycle()
+        nextBitmap?.recycle()
+        curBitmap = null
+        prevBitmap = null
+        nextBitmap = null
     }
 
-    //
-    private fun drawNextPageAreaAndShadow(
-        canvas: Canvas,
-        bitmap: Bitmap?
-    ) {
-        bitmap ?: return
-        mPath1.reset()
-        mPath1.moveTo(mBezierStart1.x, mBezierStart1.y)
-        mPath1.lineTo(mBezierVertex1.x, mBezierVertex1.y)
-        mPath1.lineTo(mBezierVertex2.x, mBezierVertex2.y)
-        mPath1.lineTo(mBezierStart2.x, mBezierStart2.y)
-        mPath1.lineTo(mCornerX.toFloat(), mCornerY.toFloat())
-        mPath1.close()
-        mDegrees = Math.toDegrees(
-            atan2(
-                (mBezierControl1.x - mCornerX).toDouble(),
-                mBezierControl2.y - mCornerY.toDouble()
-            )
-        ).toFloat()
-        val leftX: Int
-        val rightX: Int
-        val mBackShadowDrawable: GradientDrawable
-        if (mIsRtOrLb) { //左下及右上
-            leftX = mBezierStart1.x.toInt()
-            rightX = (mBezierStart1.x + mTouchToCornerDis / 4).toInt()
-            mBackShadowDrawable = mBackShadowDrawableLR
-        } else {
-            leftX = (mBezierStart1.x - mTouchToCornerDis / 4).toInt()
-            rightX = mBezierStart1.x.toInt()
-            mBackShadowDrawable = mBackShadowDrawableRL
+    private fun showGL() {
+        if (!glActive) {
+            glActive = true
+            glView.translationX = 0f
+            glView.bringToFront()
         }
-        canvas.save()
-        canvas.clipPath(mPath0)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            canvas.clipPath(mPath1)
-        } else {
-            canvas.clipPath(mPath1, Region.Op.INTERSECT)
-        }
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
-        canvas.rotate(mDegrees, mBezierStart1.x, mBezierStart1.y)
-        mBackShadowDrawable.setBounds(
-            leftX, mBezierStart1.y.toInt(),
-            rightX, (mMaxLength + mBezierStart1.y).toInt()
-        ) //左上及右下角的xy坐标值,构成一个矩形
-        mBackShadowDrawable.draw(canvas)
-        canvas.restore()
     }
 
-    //
-    private fun drawCurrentPageArea(
-        canvas: Canvas,
-        bitmap: Bitmap?
-    ) {
-        bitmap ?: return
-        mPath0.reset()
-        mPath0.moveTo(mBezierStart1.x, mBezierStart1.y)
-        mPath0.quadTo(mBezierControl1.x, mBezierControl1.y, mBezierEnd1.x, mBezierEnd1.y)
-        mPath0.lineTo(mTouchX, mTouchY)
-        mPath0.lineTo(mBezierEnd2.x, mBezierEnd2.y)
-        mPath0.quadTo(mBezierControl2.x, mBezierControl2.y, mBezierStart2.x, mBezierStart2.y)
-        mPath0.lineTo(mCornerX.toFloat(), mCornerY.toFloat())
-        mPath0.close()
-
-        canvas.save()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            canvas.clipOutPath(mPath0)
-        } else {
-            canvas.clipPath(mPath0, Region.Op.XOR)
+    private fun hideGL() {
+        if (glActive) {
+            glActive = false
+            glView.translationX = max(viewWidth * 2f, 2000f) + 100f
         }
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
-        canvas.restore()
     }
 
-    /**
-     * 计算拖拽点对应的拖拽脚
-     */
     private fun calcCornerXY(x: Float, y: Float) {
         mCornerX = if (x <= viewWidth / 2) 0 else viewWidth
         mCornerY = if (y <= viewHeight / 2) 0 else viewHeight
-        mIsRtOrLb = (mCornerX == 0 && mCornerY == viewHeight)
-                || (mCornerY == 0 && mCornerX == viewWidth)
-    }
-
-    private fun calcPoints() {
-        mTouchX = touchX
-        mTouchY = touchY
-
-        mMiddleX = (mTouchX + mCornerX) / 2
-        mMiddleY = (mTouchY + mCornerY) / 2
-        mBezierControl1.x =
-            mMiddleX - (mCornerY - mMiddleY) * (mCornerY - mMiddleY) / (mCornerX - mMiddleX)
-        mBezierControl1.y = mCornerY.toFloat()
-        mBezierControl2.x = mCornerX.toFloat()
-
-        val f4 = mCornerY - mMiddleY
-        if (f4 == 0f) {
-            mBezierControl2.y = mMiddleY - (mCornerX - mMiddleX) * (mCornerX - mMiddleX) / 0.1f
-
-        } else {
-            mBezierControl2.y =
-                mMiddleY - (mCornerX - mMiddleX) * (mCornerX - mMiddleX) / (mCornerY - mMiddleY)
-        }
-        mBezierStart1.x = mBezierControl1.x - (mCornerX - mBezierControl1.x) / 2
-        mBezierStart1.y = mCornerY.toFloat()
-
-        // 固定左边上下两个点
-        if (mTouchX > 0 && mTouchX < viewWidth) {
-            if (mBezierStart1.x < 0 || mBezierStart1.x > viewWidth) {
-                if (mBezierStart1.x < 0)
-                    mBezierStart1.x = viewWidth - mBezierStart1.x
-
-                val f1 = abs(mCornerX - mTouchX)
-                val f2 = viewWidth * f1 / mBezierStart1.x
-                mTouchX = abs(mCornerX - f2)
-
-                val f3 = abs(mCornerX - mTouchX) * abs(mCornerY - mTouchY) / f1
-                mTouchY = abs(mCornerY - f3)
-
-                mMiddleX = (mTouchX + mCornerX) / 2
-                mMiddleY = (mTouchY + mCornerY) / 2
-
-                mBezierControl1.x =
-                    mMiddleX - (mCornerY - mMiddleY) * (mCornerY - mMiddleY) / (mCornerX - mMiddleX)
-                mBezierControl1.y = mCornerY.toFloat()
-
-                mBezierControl2.x = mCornerX.toFloat()
-
-                val f5 = mCornerY - mMiddleY
-                if (f5 == 0f) {
-                    mBezierControl2.y =
-                        mMiddleY - (mCornerX - mMiddleX) * (mCornerX - mMiddleX) / 0.1f
-                } else {
-                    mBezierControl2.y =
-                        mMiddleY - (mCornerX - mMiddleX) * (mCornerX - mMiddleX) / (mCornerY - mMiddleY)
-                }
-
-                mBezierStart1.x = mBezierControl1.x - (mCornerX - mBezierControl1.x) / 2
-            }
-        }
-        mBezierStart2.x = mCornerX.toFloat()
-        mBezierStart2.y = mBezierControl2.y - (mCornerY - mBezierControl2.y) / 2
-
-        mTouchToCornerDis = hypot(
-            (mTouchX - mCornerX).toDouble(),
-            (mTouchY - mCornerY).toDouble()
-        ).toFloat()
-
-        mBezierEnd1 = getCross(
-            PointF(mTouchX, mTouchY), mBezierControl1, mBezierStart1,
-            mBezierStart2
-        )
-        mBezierEnd2 = getCross(
-            PointF(mTouchX, mTouchY), mBezierControl2, mBezierStart1,
-            mBezierStart2
-        )
-
-        mBezierVertex1.x = (mBezierStart1.x + 2 * mBezierControl1.x + mBezierEnd1.x) / 4
-        mBezierVertex1.y = (2 * mBezierControl1.y + mBezierStart1.y + mBezierEnd1.y) / 4
-        mBezierVertex2.x = (mBezierStart2.x + 2 * mBezierControl2.x + mBezierEnd2.x) / 4
-        mBezierVertex2.y = (2 * mBezierControl2.y + mBezierStart2.y + mBezierEnd2.y) / 4
     }
 
     /**
-     * 求解直线P1P2和直线P3P4的交点坐标
+     * 内置 OpenGL ES 2.0 3D 圆柱体卷页渲染视图（无需任何外部库）
      */
-    private fun getCross(P1: PointF, P2: PointF, P3: PointF, P4: PointF): PointF {
-        val crossP = PointF()
-        // 二元函数通式： y=ax+b
-        val a1 = (P2.y - P1.y) / (P2.x - P1.x)
-        val b1 = (P1.x * P2.y - P2.x * P1.y) / (P1.x - P2.x)
-        val a2 = (P4.y - P3.y) / (P4.x - P3.x)
-        val b2 = (P3.x * P4.y - P4.x * P3.y) / (P3.x - P4.x)
-        crossP.x = (b2 - b1) / (a1 - a2)
-        crossP.y = a1 * crossP.x + b1
-        return crossP
+    private class PageCurlGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Renderer {
+
+        private val cols = 36
+        private val rows = 24
+        private val vertexCount = (cols + 1) * (rows + 1)
+        private val indexCount = cols * rows * 6
+
+        // 每个顶点: x, y, z, u, v, shade, isBack (7 floats)
+        private val meshFloats = FloatArray(vertexCount * 7)
+        private val meshBuffer: FloatBuffer = ByteBuffer.allocateDirect(meshFloats.size * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+        private val indexBuffer: ShortBuffer = ByteBuffer.allocateDirect(indexCount * 2)
+            .order(ByteOrder.nativeOrder()).asShortBuffer()
+
+        // 底层下一页全屏四边形: x, y, u, v (4 floats * 4 vertices)
+        private val bgQuad = floatArrayOf(
+            -1f, -1f, 0f, 1f,
+             1f, -1f, 1f, 1f,
+            -1f,  1f, 0f, 0f,
+             1f,  1f, 1f, 0f
+        )
+        private val bgBuffer: FloatBuffer = ByteBuffer.allocateDirect(bgQuad.size * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+                put(bgQuad)
+                position(0)
+            }
+
+        private val lock = Any()
+        @Volatile private var pendingTop: Bitmap? = null
+        @Volatile private var pendingBottom: Bitmap? = null
+        @Volatile private var dirtyTextures = false
+
+        private var bgR = 0.94f
+        private var bgG = 0.91f
+        private var bgB = 0.85f
+
+        private var curlTouchX = 0f
+        private var curlTouchY = 0f
+        private var curlCornerX = 1f
+        private var curlCornerY = 1f
+        private var curlW = 1f
+        private var curlH = 1f
+        private var axisAx = 0f
+        private var axisAy = 0f
+        private var axisNx = 1f
+        private var axisNy = 0f
+        private var curlRadius = 0.08f
+
+        private var texTop = 0
+        private var texBottom = 0
+        private var frontProgram = 0
+        private var bgProgram = 0
+
+        init {
+            setEGLContextClientVersion(2)
+            setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+            holder.setFormat(PixelFormat.TRANSLUCENT)
+            setZOrderMediaOverlay(true)
+
+            val indices = ShortArray(indexCount)
+            var ptr = 0
+            for (r in 0 until rows) {
+                for (c in 0 until cols) {
+                    val i0 = (r * (cols + 1) + c).toShort()
+                    val i1 = (i0 + 1).toShort()
+                    val i2 = (i0 + cols + 1).toShort()
+                    val i3 = (i2 + 1).toShort()
+                    indices[ptr++] = i0
+                    indices[ptr++] = i2
+                    indices[ptr++] = i1
+                    indices[ptr++] = i1
+                    indices[ptr++] = i2
+                    indices[ptr++] = i3
+                }
+            }
+            indexBuffer.put(indices)
+            indexBuffer.position(0)
+
+            setRenderer(this)
+            renderMode = RENDERMODE_WHEN_DIRTY
+        }
+
+        fun setPages(top: Bitmap?, bottom: Bitmap?, paperColor: Int) {
+            synchronized(lock) {
+                pendingTop = top
+                pendingBottom = bottom
+                dirtyTextures = true
+                bgR = Color.red(paperColor) / 255f
+                bgG = Color.green(paperColor) / 255f
+                bgB = Color.blue(paperColor) / 255f
+            }
+            requestRender()
+        }
+
+        fun updateCurl(
+            touchX: Float,
+            touchY: Float,
+            cornerX: Float,
+            cornerY: Float,
+            viewW: Float,
+            viewH: Float
+        ) {
+            synchronized(lock) {
+                curlTouchX = touchX
+                curlTouchY = touchY
+                curlCornerX = cornerX
+                curlCornerY = cornerY
+                curlW = max(viewW, 1f)
+                curlH = max(viewH, 1f)
+            }
+            requestRender()
+        }
+
+        override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+            GLES20.glClearColor(0f, 0f, 0f, 0f)
+            GLES20.glEnable(GLES20.GL_BLEND)
+            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+            bgProgram = buildProgram(BG_VERTEX_SHADER, BG_FRAGMENT_SHADER)
+            frontProgram = buildProgram(CURL_VERTEX_SHADER, CURL_FRAGMENT_SHADER)
+
+            val texIds = IntArray(2)
+            GLES20.glGenTextures(2, texIds, 0)
+            texTop = texIds[0]
+            texBottom = texIds[1]
+            setupTexture(texTop)
+            setupTexture(texBottom)
+            dirtyTextures = true
+        }
+
+        override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+            GLES20.glViewport(0, 0, width, height)
+        }
+
+        override fun onDrawFrame(gl: GL10?) {
+            val topBmp: Bitmap?
+            val bottomBmp: Bitmap?
+            val needUpload: Boolean
+            val tx: Float
+            val ty: Float
+            val cx: Float
+            val cy: Float
+            val w: Float
+            val h: Float
+            val pr: Float
+            val pg: Float
+            val pb: Float
+
+            synchronized(lock) {
+                topBmp = pendingTop
+                bottomBmp = pendingBottom
+                needUpload = dirtyTextures
+                dirtyTextures = false
+                tx = curlTouchX
+                ty = curlTouchY
+                cx = curlCornerX
+                cy = curlCornerY
+                w = curlW
+                h = curlH
+                pr = bgR
+                pg = bgG
+                pb = bgB
+            }
+
+            if (needUpload) {
+                if (topBmp != null && !topBmp.isRecycled) {
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texTop)
+                    GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, topBmp, 0)
+                }
+                if (bottomBmp != null && !bottomBmp.isRecycled) {
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texBottom)
+                    GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bottomBmp, 0)
+                }
+            }
+
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+            if (topBmp == null || bottomBmp == null) return
+
+            val aspect = w / h
+            buildCylinderMesh(tx, ty, cx, cy, w, h, aspect)
+
+            // 1. 绘制底层下一页 + 卷起页投射的柔和外阴影
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            GLES20.glUseProgram(bgProgram)
+            val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPos")
+            val bgUvLoc = GLES20.glGetAttribLocation(bgProgram, "aUv")
+            bgBuffer.position(0)
+            GLES20.glEnableVertexAttribArray(bgPosLoc)
+            GLES20.glVertexAttribPointer(bgPosLoc, 2, GLES20.GL_FLOAT, false, 16, bgBuffer)
+            bgBuffer.position(2)
+            GLES20.glEnableVertexAttribArray(bgUvLoc)
+            GLES20.glVertexAttribPointer(bgUvLoc, 2, GLES20.GL_FLOAT, false, 16, bgBuffer)
+
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texBottom)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(bgProgram, "uTex"), 0)
+            GLES20.glUniform2f(GLES20.glGetUniformLocation(bgProgram, "uAxisA"), axisAx, axisAy)
+            GLES20.glUniform2f(GLES20.glGetUniformLocation(bgProgram, "uAxisN"), axisNx, axisNy)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(bgProgram, "uAspect"), aspect)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(bgProgram, "uRadius"), curlRadius)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glDisableVertexAttribArray(bgPosLoc)
+            GLES20.glDisableVertexAttribArray(bgUvLoc)
+
+            // 2. 绘制上层 3D 圆柱卷曲书页（正面 + 背面透字 + 曲面明暗）
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+            GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+            GLES20.glUseProgram(frontProgram)
+
+            val stride = 7 * 4
+            val posLoc = GLES20.glGetAttribLocation(frontProgram, "aPos")
+            val uvLoc = GLES20.glGetAttribLocation(frontProgram, "aUv")
+            val shadeLoc = GLES20.glGetAttribLocation(frontProgram, "aShade")
+            val backLoc = GLES20.glGetAttribLocation(frontProgram, "aIsBack")
+
+            meshBuffer.position(0)
+            GLES20.glEnableVertexAttribArray(posLoc)
+            GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, stride, meshBuffer)
+
+            meshBuffer.position(3)
+            GLES20.glEnableVertexAttribArray(uvLoc)
+            GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, stride, meshBuffer)
+
+            meshBuffer.position(5)
+            GLES20.glEnableVertexAttribArray(shadeLoc)
+            GLES20.glVertexAttribPointer(shadeLoc, 1, GLES20.GL_FLOAT, false, stride, meshBuffer)
+
+            meshBuffer.position(6)
+            GLES20.glEnableVertexAttribArray(backLoc)
+            GLES20.glVertexAttribPointer(backLoc, 1, GLES20.GL_FLOAT, false, stride, meshBuffer)
+
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texTop)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(frontProgram, "uTex"), 0)
+            GLES20.glUniform3f(GLES20.glGetUniformLocation(frontProgram, "uPaperColor"), pr, pg, pb)
+
+            indexBuffer.position(0)
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, indexCount, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
+
+            GLES20.glDisableVertexAttribArray(posLoc)
+            GLES20.glDisableVertexAttribArray(uvLoc)
+            GLES20.glDisableVertexAttribArray(shadeLoc)
+            GLES20.glDisableVertexAttribArray(backLoc)
+        }
+
+        private fun buildCylinderMesh(
+            touchX: Float,
+            touchY: Float,
+            cornerX: Float,
+            cornerY: Float,
+            w: Float,
+            h: Float,
+            aspect: Float
+        ) {
+            // 转换到以屏幕高度为 1.0 的世界坐标系: x in [0, aspect], y in [0, 1] (底为0，顶为1)
+            val tx = touchX / h
+            val ty = 1f - touchY / h
+            val cx = if (cornerX <= 0f) 0f else aspect
+            val cy = if (cornerY <= 0f) 1f else 0f
+
+            var dx = cx - tx
+            var dy = cy - ty
+            val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            val safeDist = max(dist, 0.0005f)
+            dx /= safeDist
+            dy /= safeDist
+
+            // 限制翻页角度不过度竖直，保持自然书页装订手感
+            val progress = min(max(dist / (aspect * 2.0f), 0f), 1f)
+            // 动态圆柱半径：拉起初期紧致，中段舒展（接近掌阅风格）
+            val r = 0.055f + 0.058f * sin(progress * PI).toFloat()
+            val halfCirc = (PI * r).toFloat()
+
+            // 折痕轴基准点（位于手指与页角之间，使翻起边缘紧贴手指）
+            val ax = (tx + cx) * 0.5f - dx * (r * 0.35f)
+            val ay = (ty + cy) * 0.5f - dy * (r * 0.35f)
+
+            axisAx = ax
+            axisAy = ay
+            axisNx = dx
+            axisNy = dy
+            curlRadius = r
+
+            var idx = 0
+            for (row in 0..rows) {
+                val v = row.toFloat() / rows // 0 = top, 1 = bottom
+                val py = 1f - v
+                for (col in 0..cols) {
+                    val u = col.toFloat() / cols
+                    val px = u * aspect
+
+                    val d = (px - ax) * dx + (py - ay) * dy
+                    var outX: Float
+                    var outY: Float
+                    var outZ: Float
+                    var shade: Float
+                    var isBack: Float
+
+                    when {
+                        d <= 0f -> {
+                            outX = px
+                            outY = py
+                            outZ = 0f
+                            // 靠近卷起折痕处做极柔和的微暗过渡
+                            val edgeProx = max(0f, 1f + d / (r * 0.6f))
+                            shade = 1f - 0.04f * edgeProx
+                            isBack = 0f
+                        }
+
+                        d < halfCirc -> {
+                            val theta = d / r
+                            val sinT = sin(theta.toDouble()).toFloat()
+                            val cosT = cos(theta.toDouble()).toFloat()
+                            val shift = r * sinT - d
+                            outX = px + dx * shift
+                            outY = py + dy * shift
+                            outZ = r * (1f - cosT)
+                            // 圆柱曲面立体明暗：外侧微微提亮，内折处渐变加深
+                            val light = 0.80f + 0.22f * sinT
+                            shade = min(max(light, 0.72f), 1.03f)
+                            isBack = if (theta > (PI * 0.5).toFloat()) 1f else 0f
+                        }
+
+                        else -> {
+                            val over = d - halfCirc
+                            val shift = -(d + over)
+                            outX = px + dx * shift
+                            outY = py + dy * shift
+                            outZ = 2f * r
+                            // 背面靠近折痕一侧保留内折阴影
+                            val foldDark = max(0f, 1f - over / (r * 1.4f))
+                            shade = 0.96f - 0.14f * foldDark
+                            isBack = 1f
+                        }
+                    }
+
+                    // 映射回 OpenGL NDC [-1, 1]，z 越大越靠前（映射到 [-0.9, 0.0] 配合 GL_LEQUAL）
+                    val ndcX = (outX / aspect) * 2f - 1f
+                    val ndcY = outY * 2f - 1f
+                    val ndcZ = -outZ * 2.0f
+
+                    meshFloats[idx++] = ndcX
+                    meshFloats[idx++] = ndcY
+                    meshFloats[idx++] = ndcZ
+                    meshFloats[idx++] = u
+                    meshFloats[idx++] = v
+                    meshFloats[idx++] = shade
+                    meshFloats[idx++] = isBack
+                }
+            }
+
+            meshBuffer.position(0)
+            meshBuffer.put(meshFloats)
+            meshBuffer.position(0)
+        }
+
+        private fun setupTexture(texId: Int) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        }
+
+        private fun buildProgram(vsSrc: String, fsSrc: String): Int {
+            val vs = compileShader(GLES20.GL_VERTEX_SHADER, vsSrc)
+            val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fsSrc)
+            val prog = GLES20.glCreateProgram()
+            GLES20.glAttachShader(prog, vs)
+            GLES20.glAttachShader(prog, fs)
+            GLES20.glLinkProgram(prog)
+            return prog
+        }
+
+        private fun compileShader(type: Int, src: String): Int {
+            val shader = GLES20.glCreateShader(type)
+            GLES20.glShaderSource(shader, src)
+            GLES20.glCompileShader(shader)
+            return shader
+        }
+
+        companion object {
+            private const val BG_VERTEX_SHADER = """
+                attribute vec2 aPos;
+                attribute vec2 aUv;
+                varying vec2 vUv;
+                void main() {
+                    vUv = aUv;
+                    gl_Position = vec4(aPos, 0.5, 1.0);
+                }
+            """
+
+            private const val BG_FRAGMENT_SHADER = """
+                precision mediump float;
+                uniform sampler2D uTex;
+                uniform vec2 uAxisA;
+                uniform vec2 uAxisN;
+                uniform float uAspect;
+                uniform float uRadius;
+                varying vec2 vUv;
+                void main() {
+                    vec4 col = texture2D(uTex, vUv);
+                    vec2 worldP = vec2(vUv.x * uAspect, 1.0 - vUv.y);
+                    float d = dot(worldP - uAxisA, uAxisN);
+                    float shadowWidth = max(uRadius * 2.2, 0.06);
+                    float s = 1.0;
+                    if (d > -0.02) {
+                        float t = clamp((d + 0.02) / shadowWidth, 0.0, 1.0);
+                        s = mix(0.62, 1.0, t * t * (3.0 - 2.0 * t));
+                    }
+                    gl_FragColor = vec4(col.rgb * s, 1.0);
+                }
+            """
+
+            private const val CURL_VERTEX_SHADER = """
+                attribute vec3 aPos;
+                attribute vec2 aUv;
+                attribute float aShade;
+                attribute float aIsBack;
+                varying vec2 vUv;
+                varying float vShade;
+                varying float vIsBack;
+                void main() {
+                    vUv = aUv;
+                    vShade = aShade;
+                    vIsBack = aIsBack;
+                    gl_Position = vec4(aPos, 1.0);
+                }
+            """
+
+            private const val CURL_FRAGMENT_SHADER = """
+                precision mediump float;
+                uniform sampler2D uTex;
+                uniform vec3 uPaperColor;
+                varying vec2 vUv;
+                varying float vShade;
+                varying float vIsBack;
+                void main() {
+                    vec4 texCol = texture2D(uTex, vUv);
+                    // 背面透字：将镜像后的书页纹理与纸张底色混合（0.72 还原掌阅透印感）
+                    vec3 backCol = mix(texCol.rgb, uPaperColor, 0.72);
+                    vec3 finalRgb = mix(texCol.rgb, backCol, step(0.5, vIsBack));
+                    gl_FragColor = vec4(finalRgb * vShade, 1.0);
+                }
+            """
+        }
     }
 }
