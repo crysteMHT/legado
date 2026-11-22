@@ -32,18 +32,19 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sign
 import kotlin.math.sin
+import kotlin.math.tanh
 
 /**
- * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v5 彻底消除结束回闪版）。
+ * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v6 跟手阻尼曲线 + 三区差异化折角版）。
  *
- * 根因修复说明：
- * 1. 修复 PageDelegate.computeScroll() 结束时 onAnimStop() 先隐藏 GL 层，但 stopScroll() 延迟到下一帧才把
- *    isRunning 设为 false，导致期间 dispatchDraw() -> onDraw() 误判仍在翻页并再次 showGL() 闪现 1 帧旧缓冲的问题；
- * 2. 引入首帧就绪同步（hasFreshFrame + alpha 门控）与延迟首帧绘制，避免新一次翻页开始时闪现上一次翻页的残影；
- * 3. 提前完成左边界收尾退出（uExit 在 -0.82*aspect 处即完全移出），给异步 GL 渲染线程留出 2~3 帧纯净底页缓冲，
- *    确保动画结束切回 ReadView 时零接缝、零闪烁。
+ * 优化内容：
+ * 1. 跟手 + 渐进阻尼曲线：前半段（手指滑过前 50%）卷轴基本 1:1 紧跟手指；后半段靠近装订边时按 tanh(1.08*u)
+ *    平滑减速（滑到对侧边缘时翻过约 79%，告别旧版仅翻 1/3 的迟滞感），松手后丝滑续接完成翻页；
+ * 2. 上/中/下三区明显差异化折角：移除原版强行锁死 touchY 的限制，传入真实 startY/touchY——
+ *    中部 1/3 为干脆的竖直平翻，上部 1/3 为右上角向下斜掀，下部 1/3 为右下角向上斜掀（并随手指上下微调角度），
+ *    同时通过精确的书脊几何约束自动收直倾角，保证左侧装订边绝不脱落或上下对折；
+ * 3. 保留 v5 的零回闪状态机（animFinished + 首帧 alpha 门控 + 提前收尾缓冲）。
  */
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
@@ -104,16 +105,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
             MotionEvent.ACTION_MOVE -> {
                 animFinished = false
-                if ((startY > viewHeight / 3 && startY < viewHeight * 2 / 3)
-                    || mDirection == PageDirection.PREV
-                ) {
-                    readView.touchY = viewHeight.toFloat()
-                }
-                if (startY > viewHeight / 3 && startY < viewHeight / 2
-                    && mDirection == PageDirection.NEXT
-                ) {
-                    readView.touchY = 1f
-                }
+                // 保留真实的 touchY，不再强行改写成顶部/底部，从而真实区分上/中/下三区翻页效果
             }
         }
     }
@@ -122,7 +114,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         super.setDirection(direction)
         when (direction) {
             PageDirection.PREV -> {
-                calcCornerXY(viewWidth.toFloat(), viewHeight.toFloat())
+                calcCornerXY(viewWidth.toFloat(), startY)
             }
 
             PageDirection.NEXT -> {
@@ -186,7 +178,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         glView.updateCurl(
             touchX = touchX,
             touchY = touchY,
-            cornerY = mCornerY.toFloat(),
+            startY = startY,
             viewW = viewWidth.toFloat(),
             viewH = viewHeight.toFloat()
         )
@@ -273,7 +265,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
         private var curlTouchX = 0f
         private var curlTouchY = 0f
-        private var curlCornerY = 1f
+        private var curlStartY = 0f
         private var curlW = 1f
         private var curlH = 1f
         private var axisAx = 0f
@@ -339,20 +331,19 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 bgG = Color.green(paperColor) / 255f
                 bgB = Color.blue(paperColor) / 255f
             }
-            // 不在这里立即 scheduleRender，等 updateCurl 传入本次翻页的新坐标后再一起渲染首帧，避免闪出上次残影
         }
 
         fun updateCurl(
             touchX: Float,
             touchY: Float,
-            cornerY: Float,
+            startY: Float,
             viewW: Float,
             viewH: Float
         ) {
             synchronized(lock) {
                 curlTouchX = touchX
                 curlTouchY = touchY
-                curlCornerY = cornerY
+                curlStartY = startY
                 curlW = max(viewW, 1f)
                 curlH = max(viewH, 1f)
             }
@@ -493,7 +484,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             val gen: Int
             val tx: Float
             val ty: Float
-            val cy: Float
+            val sy: Float
             val w: Float
             val h: Float
             val pr: Float
@@ -508,7 +499,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 gen = flipGeneration
                 tx = curlTouchX
                 ty = curlTouchY
-                cy = curlCornerY
+                sy = curlStartY
                 w = curlW
                 h = curlH
                 pr = bgR
@@ -534,7 +525,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             }
 
             val aspect = w / h
-            buildCylinderMesh(tx, ty, cy, aspect)
+            buildCylinderMesh(tx, ty, sy, aspect)
 
             // Pass 1：底层下一页 + 柔和外投影
             GLES20.glUseProgram(bgProgram)
@@ -614,68 +605,90 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         private fun buildCylinderMesh(
             touchX: Float,
             touchY: Float,
-            cornerY: Float,
+            startY: Float,
             aspect: Float
         ) {
-            var tx = touchX / curlH
-            var ty = 1f - touchY / curlH
+            val tx = touchX / curlH
+            val ty = min(max(1f - touchY / curlH, 0f), 1f)
+            val sy = min(max(1f - startY / curlH, 0f), 1f)
             val cx = aspect
-            val cy = if (cornerY <= 0f) 1f else 0f
 
-            // 1. 书脊装订圆弧约束（固定左侧 x=0 装订边，防止上下对折）
-            ty = min(max(ty, 0f), 1f)
-            if (tx > 0f) {
-                val spineDx = tx
-                val spineDy = ty - cy
-                val spineDist = hypot(spineDx.toDouble(), spineDy.toDouble()).toFloat()
-                val maxLen = aspect * 0.992f
-                if (spineDist > maxLen && spineDist > 0.0001f) {
-                    val scale = maxLen / spineDist
-                    tx = spineDx * scale
-                    ty = cy + spineDy * scale
-                }
-            }
+            // 1. 翻页进度 u：手指在右边缘为 0，滑到左边缘为 1，松手退出动画结束时为 2
+            val uDrag = min(max((cx - tx) / cx, 0f), 2f)
+            val leftProgress = min(max(uDrag * 0.5f, 0f), 1f)
 
-            // 2. 翻页进度 [0..1]：tx=+aspect 为 0，tx=-aspect 为 1
-            val leftProgress = min(max((aspect - tx) / (aspect * 2.0f), 0f), 1f)
-
-            // 3. 限制折痕倾角，越靠近左侧书脊越平滑归零
-            var dx = cx - tx
-            var dy = cy - ty
-            if (dx < 0.001f) dx = 0.001f
-            val maxSlope = 0.40f * (1f - min(leftProgress * 1.25f, 1f))
-            if (abs(dy) > dx * maxSlope) {
-                dy = sign(dy) * dx * maxSlope
-            }
-            val normLen = max(hypot(dx.toDouble(), dy.toDouble()).toFloat(), 0.0005f)
-            dx /= normLen
-            dy /= normLen
-
-            // 4. 动态圆柱半径：起点与终点自然收窄，中段舒展
+            // 2. 动态圆柱半径：起止收窄、中段舒展
             val r = 0.045f + 0.055f * sin(leftProgress * PI).toFloat()
             val halfCirc = (PI * r).toFloat()
 
-            // 5. 提前在 tx = -0.82*aspect 处即完全移出左边界，留出 2~3 帧纯净底页缓冲，避免异步 GL 延迟导致残影
+            // 3. 跟手 + 渐进阻尼曲线（tanh）：
+            //    - 前半段（uDrag 0 -> 0.5）：斜率接近 1.0，卷页紧跟手指移动；
+            //    - 后半段（uDrag 0.5 -> 1.0）：受左侧书脊牵拉，平滑减速至约 79% 处；
+            //    - 退出段（tx < 0）：从 79% 无缝衔接，提前在 tx = -0.82*aspect 处完全移出左边界。
+            val dampK = 1.08
+            val pAtEdge = tanh(dampK).toFloat()
             val ax: Float
             if (tx >= 0f) {
-                val baseAx = (tx + cx) * 0.5f - dx * (r * 0.2f)
-                // 右边界收尾（PREV 翻页完成或取消翻页）：贴近右边时平滑展平
+                val p = tanh(dampK * min(uDrag, 1f).toDouble()).toFloat()
+                val baseAx = cx * (1f - p)
                 val rightGap = cx - tx
-                ax = if (rightGap < r * 1.2f) {
-                    val uRight = 1f - min(max(rightGap / (r * 1.2f), 0f), 1f)
-                    baseAx + ((cx + r * 0.3f) - baseAx) * uRight
+                ax = if (rightGap < r * 0.8f) {
+                    val uRight = 1f - min(max(rightGap / (r * 0.8f), 0f), 1f)
+                    baseAx + ((cx + r * 0.35f) - baseAx) * uRight
                 } else {
                     baseAx
                 }
             } else {
-                val uExit = min(max(-tx / (aspect * 0.82f), 0f), 1f)
-                val startAx = cx * 0.5f - dx * (r * 0.2f)
+                val uExit = min(max(-tx / (cx * 0.82f), 0f), 1f)
+                val startAx = cx * (1f - pAtEdge)
                 val endAx = -(r * 2.6f)
                 ax = startAx + (endAx - startAx) * uExit
             }
-            val ay = (ty + cy) * 0.5f - dy * (r * 0.2f)
 
-            // 收尾阶段同步将左右两端阴影柔和淡出至 0
+            // 4. 上/中/下三区差异化折角 + 书脊防脱落几何约束：
+            //    - 中部（sy ∈ [0.33, 0.67]）：干脆竖直平翻（仅随手指上下有极轻微倾斜）；
+            //    - 下部（sy < 0.33）：右下角向上斜掀（基础约 -30°，向上滑可增至 ~43°）；
+            //    - 上部（sy > 0.67）：右上角向下斜掀（基础约 +30°，向下滑可增至 ~43°）；
+            //    - 随着 ax 靠近左侧书脊，根据精确的书脊不等式自动收直倾角，保证左侧装订边永不脱离或上下对折。
+            val ay: Float
+            var slope: Float
+            when {
+                sy in 0.33f..0.67f -> {
+                    ay = 0.5f
+                    slope = min(max((sy - ty) * 0.25f, -0.08f), 0.08f)
+                }
+
+                sy < 0.33f -> {
+                    ay = min(max(ty * 0.6f + 0.05f, 0.08f), 0.42f)
+                    val desired = -0.58f - max(0f, ty - sy) * 0.9f
+                    val safeLimit = max(0f, (ax / max(ay, 0.08f)) * 0.88f)
+                    slope = max(-min(0.95f, safeLimit), min(0f, desired))
+                }
+
+                else -> {
+                    ay = min(max(1f - (1f - ty) * 0.6f - 0.05f, 0.58f), 0.92f)
+                    val desired = 0.58f + max(0f, sy - ty) * 0.9f
+                    val safeLimit = max(0f, (ax / max(1f - ay, 0.08f)) * 0.88f)
+                    slope = min(min(0.95f, safeLimit), max(0f, desired))
+                }
+            }
+
+            // 贴近最右侧归位时将倾角平滑归零，确保 PREV 完成或取消翻页时页面 100% 展平
+            if (tx >= 0f) {
+                val rightGap = cx - tx
+                if (rightGap < r * 1.4f) {
+                    slope *= min(max(rightGap / (r * 1.4f), 0f), 1f)
+                }
+            } else {
+                // 退出阶段随 ax 逼近 0 平滑归零
+                slope *= min(max(ax / (cx * 0.25f), 0f), 1f)
+            }
+
+            val normLen = max(hypot(1.0, slope.toDouble()).toFloat(), 0.0005f)
+            val dx = 1f / normLen
+            val dy = slope / normLen
+
+            // 5. 收尾阶段同步将左右两端阴影柔和淡出至 0
             val leftFade = if (ax < r * 0.9f) {
                 min(max((ax + r * 1.4f) / (r * 2.3f), 0f), 1f)
             } else {
