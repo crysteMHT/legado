@@ -27,24 +27,22 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.tanh
 
 /**
- * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v7 复刻参考录屏双圆书脊物理版）。
+ * 基于 TextureView + OpenGL ES 2.0 3D 圆柱体网格卷曲的仿真翻页实现（v8 限制上下边过折 + 精确对齐参考图版）。
  *
- * 严格对齐参考录屏（含触摸轨迹球）的物理行为与视觉质感：
- * 1. 真实纸角跟手 + 双圆书脊约束：
- *    - 上部 1/3（右上角掀页）与下部 1/3（右下角掀页）：以「抓取书角 C」与「手指位置 P」的精确垂直平分线为卷轴，
- *      翻起的纸角/纸边精确落于手指位置（100% 跟手）；同时施加「同侧书脊圆（半径=页宽）」与「对角书脊圆（半径=对角线）」
- *      双重物理约束，既保证前半段自由斜掀（可达 50°~60°），又在靠近装订边时自然收直减速、左侧装订边绝不脱离；
- *    - 中部 1/3（水平平翻）：严格锁定竖直卷轴（0° 倾角），翻起纸边精确跟随手指水平位置；
- * 2. 复刻参考录屏的紧致卷筒光影：收紧圆柱半径（0.032~0.050），强化卷筒高光、折痕内阴影与底页投射阴影（0.34），
- *    背面半透镜像文字柔和自然；
- * 3. 完整保留 v5 零回闪状态机（animFinished + 首帧 alpha 门控 + 退出平滑续接与提前缓冲）。
+ * 优化内容：
+ * 1. 修复 v7 在上/下 1/3 区域起手或拉高时，折角飙到 60°~80° 导致上下边翻折过多的问题：
+ *    - 对纸角垂直抬起高度 |py - cy| 增加 tanh(rawLift / 0.26) 软上限（最高约 25% 屏高，精准对齐参考图）；
+ *    - 同步限制折痕最大倾角（右侧/中段 <= 36°，靠近左边缘自然收束至 <= 24°），起手与靠左时上下边均克制自然；
+ * 2. 完整保留双圆书脊约束、中部严格竖直平翻、紧致卷筒光影与零回闪状态机。
  */
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
@@ -620,12 +618,23 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 return floatArrayOf(ax, 0.5f, 1f, 0f)
             }
 
-            // 上部 1/3（右上角 cy=1）或 下部 1/3（右下角 cy=0）：双圆书脊约束 + 精确垂直平分线
+            // 上部 1/3（右上角 cy=1）或 下部 1/3（右下角 cy=0）：
+            // 先对垂直抬起高度和最大倾角做克制软限幅，避免上下边翻折过多，再叠加双圆书脊约束
             val cy = if (sy < 0.33f) 0f else 1f
             var px = min(max(pxIn, 0f), cx)
-            var py = min(max(pyIn, 0f), 1f)
+            val rawLift = abs(min(max(pyIn, 0f), 1f) - cy)
 
-            // 约束 1：到同侧书脊角 (0, cy) 的距离 <= 页宽 aspect（保证同侧装订边绝不脱落）
+            // 1. 垂直抬起软上限：最高约 26% 屏高（对齐参考图中翻起纸角的位置）
+            val cappedLift = 0.26f * tanh((rawLift / 0.26f).toDouble()).toFloat()
+
+            // 2. 最大斜率限制：右侧/中段 <= 0.72 (~35.8°)，靠近左边缘平滑收束至 <= 0.45 (~24.2°)
+            val vx0 = max(cx - px, 0f)
+            val leftFactor = min(max(px / (cx * 0.40f), 0f), 1f)
+            val maxSlope = 0.45f + 0.27f * leftFactor
+            val effLift = min(cappedLift, vx0 * maxSlope)
+            var py = if (cy == 0f) effLift else (1f - effLift)
+
+            // 3. 书脊双圆约束：保证左侧装订边绝不脱落
             val d1 = hypot(px.toDouble(), (py - cy).toDouble()).toFloat()
             val maxR1 = aspect * 0.992f
             if (d1 > maxR1 && d1 > 0.0001f) {
@@ -634,7 +643,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 py = cy + (py - cy) * scale
             }
 
-            // 约束 2：到对侧书脊角 (0, 1 - cy) 的距离 <= 对角线长度（保证对侧装订边绝不脱落）
             val oppY = 1f - cy
             val d2 = hypot(px.toDouble(), (py - oppY).toDouble()).toFloat()
             val maxR2 = hypot(aspect.toDouble(), 1.0).toFloat() * 0.992f
@@ -657,7 +665,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 dy = vy / distL
             }
 
-            // 使翻起后的纸角精确落于手指位置 (px, py)
+            // 使翻起后的纸角精确落于目标位置 (px, py)
             val shift = min(distL * 0.48f, halfCirc * 0.5f)
             val ax = (cx + px) * 0.5f - dx * shift
             val ay = (cy + py) * 0.5f - dy * shift
